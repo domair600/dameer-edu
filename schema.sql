@@ -120,6 +120,13 @@ CREATE TABLE teacher_grade_assignments (
     FOREIGN KEY (grade_id, stage_id) REFERENCES grades(id, stage_id) ON DELETE RESTRICT
 );
 
+-- حفظ المرحلة مستقلة عن الصف حتى لا تضيع إذا اختيرت مرحلة من دون صف محدد.
+CREATE TABLE teacher_stage_assignments (
+    teacher_id      BIGINT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+    stage_id        BIGINT NOT NULL REFERENCES education_stages(id) ON DELETE RESTRICT,
+    PRIMARY KEY (teacher_id, stage_id)
+);
+
 CREATE TABLE teacher_schools (
     teacher_id      BIGINT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
     school_id       BIGINT NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,

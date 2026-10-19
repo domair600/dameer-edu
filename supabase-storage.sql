@@ -37,4 +37,10 @@ CREATE POLICY dameer_schools_photo_upload
     AND (storage.foldername(name))[1] = 'schools'
   );
 
+-- Only authenticated administrators may permanently remove media objects.
+DROP POLICY IF EXISTS dameer_media_admin_delete ON storage.objects;
+CREATE POLICY dameer_media_admin_delete
+  ON storage.objects FOR DELETE TO authenticated
+  USING (bucket_id = 'dameer-media' AND public.is_dameer_admin());
+
 COMMIT;

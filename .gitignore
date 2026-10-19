@@ -1,0 +1,5 @@
+server-preview.log
+server-preview-error.log
+node_modules/
+.DS_Store
+Thumbs.db

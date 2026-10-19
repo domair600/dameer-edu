@@ -1,6 +1,8 @@
-/* Arabic-first UI for دليل الضمير التعليمي. Public content and application
+/* Arabic-first UI for منصة الضمير التعليمية. Public content and application
    submission use Supabase; account management and admin review remain staged. */
 const LEGACY_STORAGE_KEY = 'dameer-education-prototype-v1';
+const TRACKING_STORAGE_KEY = 'dameer-application-tracking-v1';
+const APPLY_DRAFT_STORAGE_KEY = 'dameer-application-draft-v1';
 const stagesCatalog = [
   { name: 'المرحلة الابتدائية', grades: ['الأول', 'الثاني', 'الثالث', 'الرابع', 'الخامس', 'السادس'] },
   { name: 'المرحلة الإعدادية', grades: ['السابع', 'الثامن', 'التاسع'] },
@@ -34,15 +36,27 @@ let selectedSchoolPhoto = '';
 let selectedSlidePhoto = '';
 let photoCrop = null;
 let backendConnected = false;
-let adminAccessToken = sessionStorage.getItem('dameer-admin-token-v1') || '';
+let backendLoading = true;
+let backendBaseLoaded = false;
+let backendLoadError = '';
+const ADMIN_SESSION_KEY = 'dameer-admin-session-v1';
+let adminSession = (() => { try { return JSON.parse(localStorage.getItem(ADMIN_SESSION_KEY) || 'null'); } catch { return null; } })();
+let adminAccessToken = adminSession?.access_token || '';
 let adminQueueLoaded = false;
 let adminQueueLoading = false;
+let adminContentRows = { teachers: [], memorials: [], listings: [] };
+let adminContentKind = 'teachers';
+let adminContentLoadError = '';
 let adminLoginError = '';
 let resetCodeTeacherId = '';
+let trackedApplications=[];
+try { trackedApplications=JSON.parse(localStorage.getItem(TRACKING_STORAGE_KEY)||'[]').filter(item=>item&&/^[A-F0-9]{16}$/i.test(item.code)); } catch {}
+let applyDraft=null;
+try { applyDraft=JSON.parse(localStorage.getItem(APPLY_DRAFT_STORAGE_KEY)||'null'); if(['teacher','memorial'].includes(applyDraft?.mode))teacherFormMode=applyDraft.mode; } catch {}
 const app = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
 const toastRoot = document.getElementById('toast-root');
-document.getElementById('year').textContent = new Date().getFullYear();
+const yearLabel=document.getElementById('year');if(yearLabel)yearLabel.textContent=new Date().getFullYear();
 
 function persist() { try { localStorage.removeItem(LEGACY_STORAGE_KEY); } catch {} }
 async function supabaseRpc(name, payload) {
@@ -54,17 +68,104 @@ async function supabaseRpc(name, payload) {
   if(!response.ok){let message='تعذر حفظ الطلب في قاعدة البيانات.';try{const body=await response.json();message=body.message||body.details||message;}catch{}throw new Error(message);}
   return response.json();
 }
+function saveTrackedApplications() {
+  try { localStorage.setItem(TRACKING_STORAGE_KEY,JSON.stringify(trackedApplications)); } catch {}
+  const resultBox=document.getElementById('form-result');
+  if(resultBox)for(const item of trackedApplications){if(item.status==='approved'&&resultBox.textContent.includes(item.code))resultBox.querySelector('.tracking-code-display')?.remove();}
+  renderTrackingTable();
+}
+function saveApplyDraft(form) {
+  if(!form||form.id!=='apply-form')return;
+  const fields={};
+  for(const element of form.elements){
+    if(!element.name||['file','submit','button'].includes(element.type))continue;
+    if(element.type==='checkbox'){
+      if(!Array.isArray(fields[element.name]))fields[element.name]=[];
+      if(element.checked)fields[element.name].push(element.value);
+    } else fields[element.name]=element.value;
+  }
+  const draft={mode:teacherFormMode,fields,photo:selectedPhoto||(applyDraft?.mode===teacherFormMode?applyDraft.photo:'')||''};
+  try { localStorage.setItem(APPLY_DRAFT_STORAGE_KEY,JSON.stringify(draft)); applyDraft=draft; }
+  catch { draft.photo=''; try { localStorage.setItem(APPLY_DRAFT_STORAGE_KEY,JSON.stringify(draft)); applyDraft=draft; } catch {} }
+}
+function restoreApplyDraft(form) {
+  if(!form)return;
+  if(applyDraft&&applyDraft.mode===teacherFormMode){
+    for(const element of form.elements){
+      if(!element.name||['file','submit','button'].includes(element.type))continue;
+      const saved=applyDraft.fields?.[element.name];
+      if(element.type==='checkbox')element.checked=Array.isArray(saved)&&saved.includes(element.value);
+      else if(saved!==undefined)element.value=saved;
+    }
+    selectedPhoto=applyDraft.photo||'';
+    updateApplyPhotoPreview(form,selectedPhoto);
+  }
+  syncApplyGradeChoices(form,false);
+}
+function syncApplyGradeChoices(form,clearInvalid=true){
+  const chosenStages=[...form.querySelectorAll('[data-stage-check]:checked')].map(input=>input.value);
+  const allowed=stagesCatalog.filter(stage=>chosenStages.includes(stage.name)).flatMap(stage=>stage.grades);
+  form.querySelectorAll('#grade-fields input[name="grades"]').forEach(input=>{const label=input.closest('.check-chip'),isAllowed=allowed.includes(input.value);label.style.display=isAllowed?'':'none';if(clearInvalid&&!isAllowed)input.checked=false;});
+}
+function updateApplyPhotoPreview(form,dataUrl){
+  const preview=form?.querySelector('[data-application-photo-preview]');if(!preview)return;
+  const image=preview.querySelector('img');
+  if(dataUrl){image.src=dataUrl;preview.hidden=false;}
+  else{image.removeAttribute('src');preview.hidden=true;}
+}
+function clearApplyDraft(){applyDraft=null;selectedPhoto='';try{localStorage.removeItem(APPLY_DRAFT_STORAGE_KEY);}catch{}}
+function renderSavedTeacherCodes(){
+  let saved={};try{saved=JSON.parse(localStorage.getItem('dameer-teacher-controls-v1')||'{}');}catch{}
+  const rows=Object.values(saved||{}).filter(item=>item?.name&&/^\d{8}$/.test(item.code||''));
+  if(!rows.length)return '';
+  return `<section class="saved-codes"><h3>رموز إدارة بطاقاتي</h3><p>محفوظة على هذا المتصفح لتستطيع الرجوع إليها. لا تشاركها مع أحد.</p>${rows.map(item=>`<div class="saved-code-row"><strong>${escapeHtml(item.name)}</strong><span><code dir="ltr">${escapeHtml(item.code)}</code><button class="btn btn-outline btn-small" type="button" data-copy-code="${escapeHtml(item.code)}">نسخ</button></span></div>`).join('')}</section>`;
+}
+function trackingStatusLabel(status) {
+  return {pending:'بانتظار مراجعة الإدارة',needs_changes:'بحاجة إلى استكمال',approved:'مقبول ومنشور',rejected:'مرفوض'}[status]||'حالة غير معروفة';
+}
+function renderTrackingTable() {
+  const host=document.getElementById('tracking-table-container');if(!host)return;
+  if(!trackedApplications.length){host.innerHTML='<p class="consent tracking-empty">لا توجد طلبات محفوظة على هذا المتصفح بعد. سيضاف طلبك تلقائيًا هنا بعد إرساله.</p>';return;}
+  host.innerHTML=`<div class="tracking-table-wrap"><table class="tracking-table"><thead><tr><th>الاسم</th><th>نوع الطلب</th><th>تاريخ الإرسال</th><th>الحالة</th><th>رمز التتبع</th><th>إجراءات</th></tr></thead><tbody>${trackedApplications.map(item=>`<tr><td>${escapeHtml(item.name||'')}</td><td>${item.kind==='memorial'?'بطاقة تذكارية':'بطاقة معلم'}</td><td>${fmtDate(item.createdAt)}</td><td><span class="status-pill ${escapeHtml(item.status||'pending')}">${trackingStatusLabel(item.status)}</span>${item.message?`<small class="tracking-message">${escapeHtml(item.message)}</small>`:''}</td><td>${item.status==='approved'?'<span class="consent">مكتمل</span>':`<code dir="ltr">${escapeHtml(item.code)}</code>`}</td><td><div class="tracking-actions">${item.status==='approved'?'':`<button class="btn btn-outline btn-small" data-check-tracking="${escapeHtml(item.code)}">تحديث</button>`}<button class="btn btn-quiet btn-small" data-remove-tracking="${escapeHtml(item.code)}">إزالة</button></div></td></tr>`).join('')}</tbody></table></div>`;
+}
+async function lookupTrackingCode(code) {
+  const normalized=String(code||'').trim().toUpperCase();
+  if(!/^[A-F0-9]{16}$/.test(normalized))throw new Error('أدخل رمز التتبع المكوّن من 16 خانة كما ظهر بعد الإرسال.');
+  const result=await supabaseRpc('track_application',{p_tracking_code:normalized});
+  if(!result?.found)throw new Error('لم نجد طلبًا بهذا الرمز. تحقق من كتابته.');
+  const existing=trackedApplications.find(item=>item.code===normalized);
+  const item={code:normalized,kind:result.kind,name:result.name||existing?.name||'',createdAt:result.created_at||existing?.createdAt||Date.now(),status:result.status,message:result.message||'',reviewedAt:result.reviewed_at||null};
+  if(existing)Object.assign(existing,item);else trackedApplications.unshift(item);
+  saveTrackedApplications();
+  return item;
+}
+async function refreshTrackedApplications() {
+  if(!trackedApplications.length||!window.DAMEER_SUPABASE?.url)return 0;
+  const results=await Promise.allSettled(trackedApplications.map(async item=>{
+    const result=await supabaseRpc('track_application',{p_tracking_code:item.code});
+    if(result?.found)Object.assign(item,{kind:result.kind,name:result.name||item.name,createdAt:result.created_at||item.createdAt,status:result.status,message:result.message||'',reviewedAt:result.reviewed_at||null});
+  }));
+  saveTrackedApplications();
+  return results.filter(result=>result.status==='rejected').length;
+}
 async function uploadImageDataUrl(dataUrl, folder) {
   if(!dataUrl)return null;
   if(!dataUrl.startsWith('data:image/jpeg;base64,'))throw new Error('صيغة الصورة غير مدعومة. أعد اختيار الصورة.');
   const config=window.DAMEER_SUPABASE;
+  if(!config?.url||!config?.anonKey)throw new Error('إعداد رفع الصور إلى Supabase غير مكتمل.');
   const blob=await (await fetch(dataUrl)).blob();
-  if(blob.size>2*1024*1024)throw new Error('حجم الصورة أكبر من الحد المسموح (2 ميغابايت).');
+  if(blob.size>2*1024*1024)throw new Error('حجم الصورة بعد القص أكبر من 2 ميغابايت. أعد اختيار الصورة وقصّها بحجم أصغر.');
   const path=`${folder}/${crypto.randomUUID()}.jpg`;
   let response;
   try{response=await fetch(`${config.url}/storage/v1/object/dameer-media/${path}`,{method:'POST',headers:{apikey:config.anonKey,Authorization:`Bearer ${config.anonKey}`,'Content-Type':'image/jpeg','x-upsert':'false'},body:blob});}
   catch{throw new Error('تعذر رفع الصورة إلى مساحة التخزين. تحقق من اتصال الإنترنت.');}
-  if(!response.ok){let body={};try{body=await response.json();}catch{}throw new Error(body.message||body.error||'فشل رفع الصورة إلى مساحة التخزين.');}
+  if(!response.ok){let body={};try{body=await response.json();}catch{}
+    const detail=body.message||body.error_description||body.error||body.details;
+    if(response.status===404)throw new Error('مساحة حفظ الصور غير مفعّلة في Supabase. شغّل ملف supabase-storage.sql ثم أعد المحاولة.');
+    if(response.status===403||/row-level security|policy/i.test(detail||''))throw new Error('Supabase رفض رفع الصورة بسبب صلاحيات التخزين. تأكد من تطبيق سياسات supabase-storage.sql.');
+    if(response.status===413)throw new Error('الصورة أكبر من الحد المسموح به للتخزين. اختر صورة أصغر.');
+    throw new Error(detail||`فشل رفع الصورة إلى مساحة التخزين (${response.status}).`);
+  }
   return `${config.url}/storage/v1/object/public/dameer-media/${path}`;
 }
 async function supabaseRows(table, query='select=*') {
@@ -73,24 +174,104 @@ async function supabaseRows(table, query='select=*') {
   if(!response.ok)throw new Error(`تعذر تحميل ${table} (${response.status})`);
   return response.json();
 }
+function saveAdminSession(session) {
+  if(session?.access_token && !session.expires_at && session.expires_in) session.expires_at=Math.floor(Date.now()/1000)+Number(session.expires_in);
+  adminSession = session || null;
+  adminAccessToken = session?.access_token || '';
+  try { if (session) localStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(session)); else localStorage.removeItem(ADMIN_SESSION_KEY); } catch {}
+}
+function clearAdminSession() {
+  saveAdminSession(null);
+  try { sessionStorage.removeItem('dameer-admin-token-v1'); } catch {}
+}
+async function refreshAdminSession() {
+  if (!adminSession?.refresh_token) throw new Error('انتهت جلسة الإدارة. سجّل الدخول مجددًا.');
+  const config=window.DAMEER_SUPABASE;
+  const response=await fetch(`${config.url}/auth/v1/token?grant_type=refresh_token`,{method:'POST',headers:{apikey:config.anonKey,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:adminSession.refresh_token})});
+  const refreshed=await response.json();
+  if(!response.ok||!refreshed.access_token) { clearAdminSession(); throw new Error('انتهت جلسة الإدارة. سجّل الدخول مجددًا.'); }
+  saveAdminSession(refreshed);
+  return refreshed.access_token;
+}
+async function ensureAdminAccessToken() {
+  if(!adminAccessToken) throw new Error('سجّل الدخول إلى لوحة الإدارة.');
+  const expiresAt=Number(adminSession?.expires_at||0)*1000;
+  if(expiresAt && expiresAt < Date.now()+60000) return refreshAdminSession();
+  return adminAccessToken;
+}
 async function adminRpc(name,payload={}) {
   const config=window.DAMEER_SUPABASE;
-  const response=await fetch(`${config.url}/rest/v1/rpc/${name}`,{method:'POST',headers:{apikey:config.anonKey,Authorization:`Bearer ${adminAccessToken}`,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  let token=await ensureAdminAccessToken();
+  let response=await fetch(`${config.url}/rest/v1/rpc/${name}`,{method:'POST',headers:{apikey:config.anonKey,Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(response.status===401){token=await refreshAdminSession();response=await fetch(`${config.url}/rest/v1/rpc/${name}`,{method:'POST',headers:{apikey:config.anonKey,Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(payload)});}
   if(!response.ok){let body={};try{body=await response.json();}catch{}throw new Error(body.message||body.details||'تعذّر تنفيذ الإجراء الإداري.');}
   return response.json();
+}
+function storagePathFromPublicUrl(url) {
+  const config=window.DAMEER_SUPABASE,marker='/storage/v1/object/public/dameer-media/';
+  if(!url||!config?.url||!url.startsWith(config.url+marker))return '';
+  try {
+    const path=decodeURIComponent(url.slice((config.url+marker).length).split('?')[0]);
+    if(!path||path.split('/').some(part=>!part||part==='.'||part==='..'))return '';
+    return path;
+  } catch { return ''; }
+}
+async function removeAdminMedia(urls) {
+  const paths=[...new Set(urls.map(storagePathFromPublicUrl).filter(Boolean))];
+  if(!paths.length)return;
+  const config=window.DAMEER_SUPABASE;
+  const token=await ensureAdminAccessToken();
+  const response=await fetch(`${config.url}/storage/v1/object/dameer-media`,{method:'DELETE',headers:{apikey:config.anonKey,Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({prefixes:paths})});
+  if(!response.ok){let body={};try{body=await response.json();}catch{}throw new Error(body.message||body.error||'تعذر حذف الصور من مساحة التخزين؛ لم تُحذف البطاقة.');}
+}
+async function setAdminContentVisibility(kind,id,visible,button) {
+  button.disabled=true;
+  try {
+    await adminRpc('admin_set_content_visibility',{p_kind:kind,p_entity_id:Number(id),p_is_visible:visible});
+    await hydrateFromSupabase();adminQueueLoaded=false;await loadAdminQueue();adminSection='content';render();toast(visible?'أُعيد إظهار البطاقة.':'أُخفيت البطاقة من الموقع.');
+  } catch(error){button.disabled=false;toast(error.message||'تعذر تغيير ظهور البطاقة.',true);}
+}
+async function deleteAdminContent(kind,id,button) {
+  const collection={teacher:'teachers',memorial:'memorials',listing:'listings'}[kind];
+  const row=(adminContentRows[collection]||[]).find(item=>String(item.id)===String(id));
+  if(!row){toast('تعذر العثور على البطاقة في القائمة. حدّث لوحة الإدارة وحاول مجددًا.',true);return;}
+  const name=kind==='listing'?row.title:row.full_name;
+  const prompt=kind==='teacher'
+    ?`حذف بطاقة «${name}» نهائيًا؟ سيُحذف معها كل ما يرتبط بها من إعلانات وبيانات وصور.`
+    :kind==='memorial'
+      ?`حذف بطاقة «${name}» التذكارية نهائيًا مع معلوماتها وصورتها؟`
+      :`حذف إعلان «${name}» نهائيًا مع صورته وبياناته؟`;
+  modalRoot.innerHTML=`<div class="modal-backdrop" data-close-admin-delete><section class="modal" role="dialog" aria-modal="true"><button class="modal-close" type="button" data-cancel-admin-delete aria-label="إغلاق">×</button><h2>تأكيد الحذف النهائي</h2><p>${escapeHtml(prompt)}</p><div class="modal-actions"><button class="btn btn-danger" type="button" data-confirm-admin-delete="${kind}" data-id="${escapeHtml(id)}">حذف نهائي</button><button class="btn btn-outline" type="button" data-cancel-admin-delete>إلغاء</button></div></section></div>`;
+}
+async function executeAdminContentDeletion(kind,id,confirmButton) {
+  const collection={teacher:'teachers',memorial:'memorials',listing:'listings'}[kind];
+  const row=(adminContentRows[collection]||[]).find(item=>String(item.id)===String(id));
+  if(!row){modalRoot.innerHTML='';toast('تعذر العثور على البطاقة في القائمة. حدّث لوحة الإدارة وحاول مجددًا.',true);return;}
+  confirmButton.disabled=true;confirmButton.textContent='جارٍ الحذف…';
+  try {
+    const urls=kind==='teacher'?[row.photo_url,...adminContentRows.listings.filter(item=>String(item.teacher_id)===String(id)).map(item=>item.image_url)]:[row.image_url||row.photo_url];
+    modalRoot.innerHTML='';toast('جارٍ حذف البطاقة وبياناتها المرتبطة…');
+    await removeAdminMedia(urls);
+    await adminRpc('admin_delete_content',{p_kind:kind,p_entity_id:Number(id)});
+    await hydrateFromSupabase();adminQueueLoaded=false;await loadAdminQueue();adminSection='content';render();toast('حُذفت البطاقة وكل بياناتها وصورها التابعة.');
+  } catch(error){modalRoot.innerHTML='';toast(error.message||'تعذر حذف المحتوى.',true);}
 }
 async function loadAdminQueue() {
   if(adminQueueLoading||!adminAccessToken)return;
   adminQueueLoading=true;
   try {
     const [result,slideRows]=await Promise.all([adminRpc('admin_list_review_queue'),adminRpc('admin_list_homepage_slides')]);
+    let contentRows=null;
+    try { contentRows=await adminRpc('admin_list_manageable_content');adminContentLoadError=''; }
+    catch(error) { adminContentLoadError=error.message||'لم يتم إعداد وظائف إدارة البطاقات في قاعدة البيانات بعد.'; }
     db.teacherRequests=(result.teachers||[]).map(r=>({id:String(r.id),status:r.status,createdAt:r.created_at,message:r.review_message||'',data:r.payload||{},kind:'teacher'}));
     db.memorialRequests=(result.memorials||[]).map(r=>({id:String(r.id),status:r.status,createdAt:r.created_at,message:r.review_message||'',data:{name:r.full_name,bio:r.biography,photo:r.photo_url||'',submitter:r.submitted_by||'',phone:r.submitter_contact||''},kind:'memorial'}));
     db.slides=(slideRows||[]).map(slide=>({id:String(slide.id),image:slide.image_url||'',eyebrow:slide.eyebrow||'',titleLine:slide.title_line||'',titleEmphasis:slide.title_emphasis||'',desc:slide.description||'',primary:slide.primary_text||'',primaryView:slide.primary_view||'teachers',secondary:slide.secondary_text||'',secondaryView:slide.secondary_view||'lessons',sortOrder:slide.sort_order||0,active:slide.is_active}));
+    if(contentRows)adminContentRows={teachers:contentRows.teachers||[],memorials:contentRows.memorials||[],listings:contentRows.listings||[]};
     adminQueueLoaded=true;adminLoginError='';
   } catch(error) {
     adminLoginError=error.message||'تعذّر تحميل الطلبات.';
-    if(/غير مصرح|jwt|token|auth/i.test(adminLoginError)){adminAccessToken='';sessionStorage.removeItem('dameer-admin-token-v1');}
+    if(/انتهت جلسة الإدارة/i.test(adminLoginError)){clearAdminSession();}
   } finally {adminQueueLoading=false;render();}
 }
 async function loginAdmin(form) {
@@ -100,40 +281,51 @@ async function loginAdmin(form) {
     const response=await fetch(`${config.url}/auth/v1/token?grant_type=password`,{method:'POST',headers:{apikey:config.anonKey,'Content-Type':'application/json'},body:JSON.stringify({email:values.email,password:values.password})});
     const session=await response.json();
     if(!response.ok)throw new Error(session.msg||session.message||'بيانات الدخول غير صحيحة.');
-    adminAccessToken=session.access_token;sessionStorage.setItem('dameer-admin-token-v1',adminAccessToken);adminQueueLoaded=false;
+    saveAdminSession(session);adminQueueLoaded=false;
     await loadAdminQueue();
   } catch(error){adminLoginError=error.message||'تعذر تسجيل الدخول.';button.disabled=false;button.textContent='دخول لوحة الإدارة';render();}
 }
 async function hydrateFromSupabase() {
+  backendLoading=true;backendLoadError='';render();
+  let schools,teachers,listings,memorials,homepageSlides;
   try {
-    const [schools,subjects,stages,grades,teachers,contacts,teacherSubjects,teacherGrades,teacherSchools,services,listings,memorials,homepageSlides]=await Promise.all([
+    [schools,teachers,listings,memorials,homepageSlides]=await Promise.all([
       supabaseRows('schools','select=id,name,address,phone,whatsapp,location_url,description,image_url&is_active=eq.true&order=name'),
-      supabaseRows('subjects','select=id,name&is_active=eq.true&order=sort_order'),
-      supabaseRows('education_stages','select=id,name&is_active=eq.true&order=sort_order'),
-      supabaseRows('grades','select=id,stage_id,name&is_active=eq.true&order=sort_order'),
       supabaseRows('teachers','select=id,public_id,full_name,gender,employment_status,biography,experience_years,address,photo_url,is_published,home_featured,home_badge_text&is_published=eq.true&order=full_name'),
-      supabaseRows('teacher_contacts','select=teacher_id,contact_type,phone_number,sort_order&order=sort_order'),
-      supabaseRows('teacher_subjects','select=teacher_id,subjects(name)'),
-      supabaseRows('teacher_grade_assignments','select=teacher_id,grades(name),education_stages(name)'),
-      supabaseRows('teacher_schools','select=teacher_id,school_id,schools(name)&is_current=eq.true'),
-      supabaseRows('teacher_services','select=teacher_id,title&order=sort_order'),
       supabaseRows('teacher_listings','select=id,teacher_id,title,listing_type,description,location,price_text,image_url,start_date,grade_text,last_bumped_at,status,home_featured,home_badge_text,subjects!teacher_listings_subject_id_fkey(name),teacher_listing_subjects(subjects!teacher_listing_subjects_subject_id_fkey(name)),grades(name)&status=eq.published&order=last_bumped_at.desc'),
       supabaseRows('memorial_teachers','select=id,full_name,biography,photo_url,is_published,home_featured,home_badge_text&is_published=eq.true&order=full_name'),
       supabaseRows('homepage_slides','select=id,image_url,eyebrow,title_line,title_emphasis,description,primary_text,primary_view,secondary_text,secondary_view,sort_order,is_active&is_active=eq.true&order=sort_order,id'),
     ]);
-    const related=(rows,id)=>rows.filter(row=>row.teacher_id===id);
     db.schools=schools.map(s=>({id:String(s.id),name:s.name,type:s.description||'مدرسة',address:s.address||'',phone:s.phone||'',whatsapp:s.whatsapp||'',location:s.location_url||'',image:s.image_url||''}));
-    db.teachers=teachers.map(t=>({id:String(t.id),publicId:t.public_id,name:t.full_name,gender:t.gender,status:t.employment_status,years:t.experience_years||0,address:t.address||'',bio:t.biography||'',photo:t.photo_url||'',featured:!!t.home_featured,badgeText:t.home_badge_text||'',approved:true,demo:false,schoolId:String(related(teacherSchools,t.id)[0]?.school_id||''),subjects:related(teacherSubjects,t.id).map(x=>x.subjects?.name).filter(Boolean),stages:[...new Set(related(teacherGrades,t.id).map(x=>x.education_stages?.name).filter(Boolean))],grades:related(teacherGrades,t.id).map(x=>x.grades?.name).filter(Boolean),services:related(services,t.id).map(x=>x.title),contacts:related(contacts,t.id).map(x=>({type:x.contact_type,value:x.phone_number}))}));
+    db.teachers=teachers.map(t=>({id:String(t.id),publicId:t.public_id,name:t.full_name,gender:t.gender,status:t.employment_status,years:t.experience_years||0,address:t.address||'',bio:t.biography||'',photo:t.photo_url||'',featured:!!t.home_featured,badgeText:t.home_badge_text||'',approved:true,demo:false,schoolId:'',subjects:[],stages:[],grades:[],services:[],contacts:[]}));
     db.listings=listings.map(l=>{const subjects=(l.teacher_listing_subjects||[]).map(x=>x.subjects?.name).filter(Boolean);if(!subjects.length&&l.subjects?.name)subjects.push(l.subjects.name);return {id:String(l.id),teacherId:String(l.teacher_id),title:l.title,type:l.listing_type,description:l.description,subjects,subject:subjects.join('، '),grades:l.grade_text||l.grades?.name||'',startDate:l.start_date||'',location:l.location||'',price:l.price_text||'للتواصل والاستفسار',image:l.image_url||'',bumpAt:new Date(l.last_bumped_at).getTime(),status:l.status,featured:!!l.home_featured,badgeText:l.home_badge_text||'',demo:false};});
     db.memorials=memorials.map(m=>({id:String(m.id),name:m.full_name,bio:m.biography,photo:m.photo_url||'',featured:!!m.home_featured,badgeText:m.home_badge_text||'',approved:true,demo:false}));
     db.slides=homepageSlides.map(slide=>({id:String(slide.id),image:slide.image_url||'',eyebrow:slide.eyebrow||'',titleLine:slide.title_line||'',titleEmphasis:slide.title_emphasis||'',desc:slide.description||'',primary:slide.primary_text||'',primaryView:slide.primary_view||'teachers',secondary:slide.secondary_text||'',secondaryView:slide.secondary_view||'lessons',sortOrder:slide.sort_order||0,active:slide.is_active}));
     slides=db.slides.length?db.slides:[];if(slides.length&&heroIndex>=slides.length)heroIndex=0;
     db.teacherRequests=[];db.memorialRequests=[];
+    backendConnected=true;backendBaseLoaded=true;backendLoading=false;render();
+  } catch(error) {
+    backendConnected=false;backendBaseLoaded=false;backendLoading=false;backendLoadError='تعذر تحميل الدليل من قاعدة البيانات.';db=emptyData();slides=[];render();console.warn('Supabase connection:',error);return;
+  }
+  try {
+    const [subjects,stages,grades,contacts,teacherSubjects,teacherStages,teacherGrades,teacherSchools,services]=await Promise.all([
+      supabaseRows('subjects','select=id,name&is_active=eq.true&order=sort_order'),
+      supabaseRows('education_stages','select=id,name&is_active=eq.true&order=sort_order'),
+      supabaseRows('grades','select=id,stage_id,name&is_active=eq.true&order=sort_order'),
+      supabaseRows('teacher_contacts','select=teacher_id,contact_type,phone_number,sort_order&order=sort_order'),
+      supabaseRows('teacher_subjects','select=teacher_id,subjects(name)'),
+      supabaseRows('teacher_stage_assignments','select=teacher_id,education_stages(name)').catch(error=>{if(error.message.includes('(404)'))return [];throw error;}),
+      supabaseRows('teacher_grade_assignments','select=teacher_id,grades(name),education_stages(name)'),
+      supabaseRows('teacher_schools','select=teacher_id,school_id,schools(name)&is_current=eq.true'),
+      supabaseRows('teacher_services','select=teacher_id,title&order=sort_order'),
+    ]);
+    const related=(rows,id)=>rows.filter(row=>row.teacher_id===id);
+    db.teachers=db.teachers.map(t=>{const id=Number(t.id),teacherStageRows=related(teacherStages,id),teacherGradeRows=related(teacherGrades,id);return {...t,schoolId:String(related(teacherSchools,id)[0]?.school_id||''),subjects:related(teacherSubjects,id).map(x=>x.subjects?.name).filter(Boolean),stages:[...new Set([...teacherStageRows.map(x=>x.education_stages?.name),...teacherGradeRows.map(x=>x.education_stages?.name)].filter(Boolean))],grades:teacherGradeRows.map(x=>x.grades?.name).filter(Boolean),services:related(services,id).map(x=>x.title),contacts:related(contacts,id).map(x=>({type:x.contact_type,value:x.phone_number}))};});
     subjectCatalog.splice(0,subjectCatalog.length,...subjects.map(s=>s.name));
     stagesCatalog.splice(0,stagesCatalog.length,...stages.map(s=>({name:s.name,grades:grades.filter(g=>g.stage_id===s.id).map(g=>g.name)})));
-    backendConnected=true;render();
+    backendLoadError='';render();
   } catch(error) {
-    backendConnected=false;db=emptyData();slides=[];render();console.warn('Supabase connection:',error);
+    backendLoadError='تعذر تحميل بعض تفاصيل المعلمين. أعد المحاولة لتحديث البيانات.';render();console.warn('Supabase details:',error);
   }
 }
 function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
@@ -143,9 +335,10 @@ function schoolById(id) { return db.schools.find(s=>s.id===id); }
 function fmtDate(date) { try { return new Intl.DateTimeFormat('ar-SY',{dateStyle:'medium'}).format(new Date(date)); } catch { return ''; } }
 function setView(next, updateHistory=true) {
   clearTimeout(searchDebounceTimer);searchDebounceTimer=null;
-  if(next==='home'&&view!=='home'){homeSearchDraft={query:'',mode:'all',subject:''};searchState={query:'',mode:'all',subject:'',grade:'',listingType:''};searchResultFilter='all';searchLimit=20;}
   const page=document.body.dataset.page||'public';
   if(dedicatedPageFiles[next]&&page!==next){location.href=`${dedicatedPageFiles[next]}#${next}`;return;}
+  if(page==='public'&&window.DAMEER_SUPABASE?.prelaunchMode&&['home','teachers','lessons','schools','memorials','search'].includes(next)){view='prelaunch';render();if(updateHistory&&location.hash!=='#home')history.pushState({},'','#home');return;}
+  if(next==='home'&&view!=='home'){homeSearchDraft={query:'',mode:'all',subject:''};searchState={query:'',mode:'all',subject:'',grade:'',listingType:''};searchResultFilter='all';searchLimit=20;}
   if(page!=='public'&&!dedicatedPageFiles[next]&&['home','teachers','lessons','schools','memorials','search'].includes(next)){location.href=`index.html#${next}`;return;}
   view=next;
   if(next==='admin'&&adminAccessToken)adminQueueLoaded=false;
@@ -159,7 +352,10 @@ window.addEventListener('popstate',()=>{
 });
 function toast(message, error=false) { toastRoot.innerHTML=`<div class="toast ${error?'error':''}">${escapeHtml(message)}</div>`; const el=toastRoot.firstElementChild; requestAnimationFrame(()=>el.classList.add('show')); setTimeout(()=>el.classList.remove('show'),3000); }
 function routeLink(label, next, extra='') { return `<button class="text-link ${extra}" data-view="${next}">${label} <span aria-hidden="true">←</span></button>`; }
-function pageHero(title, subtitle, icon='✦') { return `<section class="page-hero"><div class="container page-hero-inner"><div><div class="section-kicker">دليل الضمير التعليمي</div><h1>${title}</h1><p>${subtitle}</p></div><div class="page-hero-icon" aria-hidden="true">${icon}</div></div></section>`; }
+function pageHero(title, subtitle, icon='✦') { return `<section class="page-hero"><div class="container page-hero-inner"><div><div class="section-kicker">منصة الضمير التعليمية</div><h1>${title}</h1><p>${subtitle}</p></div><div class="page-hero-icon" aria-hidden="true">${icon}</div></div></section>`; }
+function renderPrelaunch() {
+  return `<section class="prelaunch-wrap"><div class="container"><div class="prelaunch-card"><span class="prelaunch-kicker"><span aria-hidden="true">✦</span> التسجيل المبكر مفتوح</span><h1>منصة الضمير التعليمية<br><em>قريبًا في خدمتكم</em></h1><p>نستقبل الآن طلبات المعلمين والمعلمات في مدينة الضمير لمراجعتها وتجهيز البطاقات قبل الإطلاق الرسمي.</p><a class="btn btn-primary prelaunch-cta" href="apply.html">قدّم طلب الانضمام <span aria-hidden="true">←</span></a><small>صفحة المنصة الرئيسية وأقسام الدليل ستُفتح عند موعد الإطلاق.</small><div class="prelaunch-decoration" aria-hidden="true">✦</div></div></div></section>`;
+}
 function sectionHead(kicker,title,desc,action='') { return `<div class="section-head"><div><div class="section-kicker">${kicker}</div><h2>${title}</h2>${desc?`<p>${desc}</p>`:''}</div>${action}</div>`; }
 function avatarMarkup(person, small=false) { const genderClass=person.gender==='female'?'avatar-female':''; const sizeClass=small?' avatar-small':''; return `<div class="avatar ${genderClass}${sizeClass}">${person.photo?`<img src="${person.photo}" alt="صورة ${escapeHtml(person.name)}">`:escapeHtml(initials(person.name))}</div>`; }
 function featuredAttrs(item,baseClass='') { return `class="${baseClass}${item.featured?' featured-card':''}"${item.featured?` data-featured="true"`:''}`; }
@@ -178,10 +374,10 @@ function teacherCard(t) {
   const gradeTags=(t.grades||[]).map(grade=>`<span class="education-chip">${escapeHtml(grade)}</span>`).join('')||'<span class="education-empty">غير محددة</span>';
   return `<article ${featuredAttrs(t,'teacher-card')} data-open-teacher="${escapeHtml(t.id)}">${featuredBadge(t)}
     ${t.demo?'<span class="badge-sample">مثال تجريبي</span>':''}
-    <div class="teacher-top">${avatarMarkup(t)}<div><h3 class="teacher-name">${escapeHtml(t.name)}</h3><div class="teacher-subject">${escapeHtml(subject)}</div><div class="teacher-meta">${(t.status==='retired'?'<span class="tag retired">متقاعد</span>':'')}<span class="tag gender">${t.gender==='female'?'معلمة':'معلم'}</span>${school?`<span class="tag">${escapeHtml(school.name)}</span>`:''}</div></div></div>
+    <div class="teacher-top">${avatarMarkup(t)}<div><h3 class="teacher-name">${escapeHtml(t.name)}</h3><div class="teacher-subject">${escapeHtml(subject)}</div><div class="teacher-meta">${(t.status==='retired'?'<span class="tag retired">متقاعد</span>':'')}<span class="tag gender">${t.gender==='female'?'معلمة':'معلم'}</span>${school?`<span class="tag">${escapeHtml(school.name)}</span>`:''}<span class="tag teacher-experience">${t.years?`${t.years} سنة خبرة`:'خبرة تعليمية'}</span></div></div></div>
     <div class="teacher-education"><div class="teacher-education-row"><span class="teacher-education-label"><svg class="education-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18M5 19V9l7-4 7 4v10M9 19v-6h6v6M8 10h.01M16 10h.01"/></svg>المراحل</span><div class="teacher-education-values">${stageTags}</div></div><div class="teacher-education-row"><span class="teacher-education-label"><svg class="education-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5c3.3-.9 6.3-.4 9 1.5v13c-2.7-1.9-5.7-2.4-9-1.5zM21 5.5c-3.3-.9-6.3-.4-9 1.5v13c2.7-1.9 5.7-2.4 9-1.5zM6 9h3M6 12h3M15 9h3M15 12h3"/></svg>الصفوف</span><div class="teacher-education-values">${gradeTags}</div></div></div>
     <p class="teacher-bio">${escapeHtml(t.bio||'لا توجد نبذة مضافة حتى الآن.')}</p>
-    <div class="card-bottom"><span class="teacher-exp">${t.years?`${t.years} سنة خبرة`:'خبرة تعليمية'}</span><div class="teacher-actions"><button class="icon-btn" title="مشاركة البطاقة" data-share-teacher="${escapeHtml(t.id)}">↗</button>${t.contacts?.[0]?.value?`<a class="icon-btn" title="اتصال" href="tel:${escapeHtml(t.contacts[0].value)}" onclick="event.stopPropagation()">☎</a>`:''}<button class="btn btn-outline btn-small" data-open-teacher="${escapeHtml(t.id)}">عرض البطاقة</button></div></div>
+    <div class="card-bottom"><div class="teacher-actions"><button class="icon-btn" title="مشاركة البطاقة" data-share-teacher="${escapeHtml(t.id)}">↗</button>${t.contacts?.[0]?.value?`<a class="icon-btn" title="اتصال" href="tel:${escapeHtml(t.contacts[0].value)}" onclick="event.stopPropagation()">☎</a>`:''}<button class="btn btn-outline btn-small" data-open-teacher="${escapeHtml(t.id)}">عرض البطاقة</button></div></div>
   </article>`;
 }
 function listingCard(listing) {
@@ -207,15 +403,23 @@ function emptyState(title, desc, icon='⌕') { return `<div class="empty-state">
 
 let slides=[];
 function renderHero() {
-  const s=slides[heroIndex]||slides[0];if(!s)return '';
+  const fallback={eyebrow:'منصة الضمير التعليمية',titleLine:'أهل الضمير',titleEmphasis:'تعليم أقرب',desc:'مساحة تجمع المعلمين والمعلمات والدورات والمدارس في مدينتنا.',primary:'تصفح المعلمين',primaryView:'teachers',secondary:'الدورات والدروس',secondaryView:'lessons'};
+  const s=slides[heroIndex]||slides[0]||(!backendBaseLoaded?fallback:null);if(!s)return '';
   const heroImage=s.image?` style="background-image:linear-gradient(118deg,rgba(8,38,75,.94) 0%,rgba(12,61,115,.82) 55%,rgba(20,100,156,.72) 100%),url('${escapeHtml(s.image)}');background-size:cover;background-position:center"`:'';
   return `<section class="hero-wrap"><div class="container"><div class="hero"${heroImage}><div class="hero-content hero-slide"><span class="eyebrow">${escapeHtml(s.eyebrow)}</span><h1>${escapeHtml(s.titleLine)}<br><em>${escapeHtml(s.titleEmphasis)}</em></h1><p class="hero-desc">${escapeHtml(s.desc)}</p><div class="hero-actions"><button class="btn btn-white" data-view="${escapeHtml(s.primaryView||'teachers')}">${escapeHtml(s.primary)} <span>←</span></button><button class="btn btn-glass" data-view="${escapeHtml(s.secondaryView||'lessons')}">${escapeHtml(s.secondary)}</button></div><div class="slide-controls">${slides.map((_,i)=>`<button class="slide-dot ${i===heroIndex?'active':''}" aria-label="الشريحة ${i+1}" data-slide="${i}"></button>`).join('')}<button class="slide-arrow" aria-label="الشريحة التالية" data-slide-next>←</button></div></div><div class="hero-art" aria-hidden="true"><span class="hero-star s1">✦</span><div class="hero-orb"><div class="book-art"><div class="book-page left"><span class="book-lines"></span></div><div class="book-page right"><span class="book-lines"></span></div><div class="book-spine"></div></div></div><span class="hero-star s2">✧</span></div></div>
     <form class="search-panel" id="home-search"><label class="search-field"><span class="field-icon">⌕</span><input name="query" placeholder="اسم معلم، مادة، أو درس..." value="${escapeHtml(homeSearchDraft.query)}"></label><label class="search-field"><span class="field-icon">▤</span><select name="mode"><option value="all" ${homeSearchDraft.mode==='all'?'selected':''}>بحث شامل</option><option value="name" ${homeSearchDraft.mode==='name'?'selected':''}>حسب الاسم</option><option value="subject" ${homeSearchDraft.mode==='subject'?'selected':''}>حسب المادة</option><option value="grade" ${homeSearchDraft.mode==='grade'?'selected':''}>حسب الصف</option></select></label><label class="search-field"><span class="field-icon">⌄</span><select name="subject"><option value="" ${homeSearchDraft.subject===''?'selected':''}>كل المواد</option>${subjectCatalog.map(s=>`<option value="${escapeHtml(s)}" ${homeSearchDraft.subject===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></label><button class="btn btn-primary" type="submit">ابحث الآن <span>←</span></button></form>
-    <div class="stats-row"><div class="stat-card"><span class="stat-icon">♙</span><div><strong>${db.teachers.filter(t=>t.approved&&t.gender==='male').length}</strong><span>معلمون</span></div></div><div class="stat-card"><span class="stat-icon teal">♙</span><div><strong>${db.teachers.filter(t=>t.approved&&t.gender==='female').length}</strong><span>معلمات</span></div></div><div class="stat-card"><span class="stat-icon gold">✦</span><div><strong>${db.listings.filter(x=>x.status==='published').length}</strong><span>دورات ودروس</span></div></div><div class="stat-card"><span class="stat-icon">▣</span><div><strong>${db.schools.length}</strong><span>مدارس</span></div></div></div></div></section>`;
+    <div class="stats-row"><div class="stat-card"><span class="stat-icon">♙</span><div><strong>${backendBaseLoaded?db.teachers.filter(t=>t.approved&&t.gender==='male').length:'—'}</strong><span>معلمون</span></div></div><div class="stat-card"><span class="stat-icon teal">♙</span><div><strong>${backendBaseLoaded?db.teachers.filter(t=>t.approved&&t.gender==='female').length:'—'}</strong><span>معلمات</span></div></div><div class="stat-card"><span class="stat-icon gold">✦</span><div><strong>${backendBaseLoaded?db.listings.filter(x=>x.status==='published').length:'—'}</strong><span>دورات ودروس</span></div></div><div class="stat-card"><span class="stat-icon">▣</span><div><strong>${backendBaseLoaded?db.schools.length:'—'}</strong><span>مدارس</span></div></div></div></div></section>`;
+}
+function renderHomeLoadNotice() {
+  if(backendLoading)return `<div class="container"><div class="home-load-state" role="status" aria-live="polite"><span class="home-load-spinner" aria-hidden="true"></span><span><strong>نجهّز منصة الضمير التعليمية</strong><small>جارٍ تحميل المعلمين والدورات والمدارس…</small></span></div></div>`;
+  if(backendLoadError)return `<div class="container"><div class="home-load-state home-load-error" role="status"><span aria-hidden="true">!</span><span><strong>${escapeHtml(backendLoadError)}</strong><small>تحقق من اتصال الإنترنت ثم حاول مرة أخرى.</small></span><button type="button" class="btn btn-outline btn-small" data-retry-content>إعادة المحاولة</button></div></div>`;
+  return '';
 }
 function renderHome() {
-  if(homeSearchDraft.query.trim())return `${renderHero()}${renderSearch(true)}`;
-  return `${renderHero()}<section class="section"><div class="container">${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}
+  const notice=renderHomeLoadNotice();
+  if(homeSearchDraft.query.trim())return `${renderHero()}${notice}${backendBaseLoaded?renderSearch(true):''}`;
+  if(!backendBaseLoaded)return `${renderHero()}<section class="section"><div class="container">${notice}${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}<div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>`;
+  return `${renderHero()}${notice}<section class="section"><div class="container">${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}
     <div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>
     <section class="section section-white"><div class="container">${sectionHead('أهل الخبرة','معلمون ومعلمات من الضمير','تعرّف إلى الكادر التعليمي القريب منك.',routeLink('عرض الدليل كاملاً','teachers'))}<div class="teacher-grid">${homeSelection(db.teachers.filter(t=>t.approved),3).map(teacherCard).join('')}</div></div></section>
     <section class="section"><div class="container">${sectionHead('فرص قريبة','دورات ودروس معلنة','إعلانات تعليمية أضافها المعلمون مباشرة.',routeLink('كل الإعلانات','lessons'))}<div class="listing-grid">${homeSelection(db.listings.filter(x=>x.status==='published'),3).map(listingCard).join('')}</div></div></section>
@@ -248,14 +452,14 @@ function renderSchools() { return `${pageHero('مدارس مدينة الضمي�
 function renderMemorials() { return `${pageHero('معلمون تركوا أثرًا','صفحات وفاء تخلّد ذكرى المعلمين والمعلمات الراحلين وتحتفظ بسيرتهم.','✦')}<section class="section"><div class="container">${db.memorials.filter(m=>m.approved).length?`<div class="memorial-grid">${db.memorials.filter(m=>m.approved).map(memorialCard).join('')}</div>`:emptyState('لا توجد بطاقات تذكارية بعد','يمكن إرسال طلب إضافة بطاقة للمراجعة من نموذج التقديم.','✦')}<div class="impact-strip"><div><strong>احفظوا ذكرى من علّمكم</strong><span>الصورة والنبذة تُعرضان بعد موافقة الإدارة.</span></div><button class="btn btn-outline" data-view="apply" data-form-kind="memorial">إرسال بطاقة تذكارية <span>←</span></button></div></div></section>`; }
 function teacherForm() {
   const schools=db.schools.map(s=>`<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)}</option>`).join('');
-  return `<h2 class="form-section-title">البيانات الأساسية</h2><div class="form-grid"><div class="field"><label>الاسم الكامل <span class="hint">مطلوب</span></label><input name="name" required maxlength="200" placeholder="الاسم كما ترغب أن يظهر في الدليل" aria-describedby="teacher-name-note" data-teacher-name><small class="name-care-note" id="teacher-name-note" hidden>اكتب اسمك بعناية، مع الانتباه للمسافات. سيُعتمد هذا الاسم كاسمك واسم المستخدم الدائم، ولا يمكنك تعديله بنفسك بعد الإرسال.</small></div><div class="field"><label>الصفة</label><select name="gender" required><option value="female">معلمة</option><option value="male">معلم</option></select></div><div class="field"><label>الحالة الوظيفية</label><select name="status"><option value="active">على رأس العمل</option><option value="retired">متقاعد / متقاعدة</option></select></div><div class="field"><label>سنوات الخبرة</label><input name="years" type="number" min="0" max="60" placeholder="مثال: 12"></div><div class="field full"><label>الصورة الشخصية <span class="hint">اختيارية</span></label><label class="upload-box"><span class="upload-symbol">▧</span><span><strong>اختر صورة من جهازك</strong><small>قصّ مربع للصورة قبل الرفع، والصورة اختيارية</small></span><input name="photo" type="file" accept="image/*" data-photo-input data-crop-ratio="1"></label></div><div class="field full"><label>نبذة مختصرة عنك</label><textarea name="bio" maxlength="700" placeholder="عرّف الطلاب والأهالي بخبرتك وطريقتك في التعليم"></textarea></div><div class="field full"><label>العنوان أو المنطقة <span class="hint">اختياري</span></label><input name="address" placeholder="مثال: مدينة الضمير — المركز"></div></div>
+  return `<h2 class="form-section-title">البيانات الأساسية</h2><div class="form-grid"><div class="field"><label>الاسم الكامل <span class="hint">مطلوب</span></label><input name="name" required minlength="2" maxlength="200" placeholder="اكتب اسمك الثلاثي بعناية كما تريد ظهوره في الدليل" aria-describedby="teacher-name-note" data-teacher-name><small class="name-care-note" id="teacher-name-note" hidden>اكتب اسمك بعناية، مع الانتباه للمسافات. سيُعتمد هذا الاسم كاسمك واسم المستخدم الدائم، ولا يمكنك تعديله بنفسك بعد الإرسال.</small></div><div class="field"><label>الصفة</label><select name="gender" required><option value="female">معلمة</option><option value="male">معلم</option></select></div><div class="field"><label>الحالة الوظيفية</label><select name="status"><option value="active">على رأس العمل</option><option value="retired">متقاعد / متقاعدة</option></select></div><div class="field"><label>سنوات الخبرة</label><input name="years" type="number" min="0" max="60" placeholder="مثال: 12"></div><div class="field full"><label>الصورة الشخصية <span class="hint">اختيارية</span></label><label class="upload-box"><span class="upload-symbol">▧</span><span><strong>اختر صورة من جهازك</strong><small>قصّ مربع للصورة قبل الرفع، والصورة اختيارية</small></span><input name="photo" type="file" accept="image/*" data-photo-input data-crop-ratio="1"></label><div class="application-photo-preview" data-application-photo-preview hidden><img alt="معاينة الصورة الشخصية"><button type="button" class="photo-remove-button" data-remove-application-photo aria-label="إزالة الصورة">×</button><span>معاينة الصورة المختارة</span></div></div><div class="field full"><label>نبذة مختصرة عنك</label><textarea name="bio" maxlength="700" placeholder="عرّف الطلاب والأهالي بخبرتك وطريقتك في التعليم"></textarea></div><div class="field full"><label>العنوان أو المنطقة <span class="hint">اختياري</span></label><input name="address" placeholder="مثال: مدينة الضمير — المركز"></div></div>
     <h2 class="form-section-title">المواد والمراحل</h2><div class="form-grid"><div class="field full"><label>المواد التي تدرّسها</label><div class="checkbox-grid">${subjectCatalog.map((s,i)=>`<label class="check-chip"><input type="checkbox" name="subjects" value="${s}"><span>${s}</span></label>`).join('')}</div></div><div class="field full"><label>المراحل التي تدرّسها</label><div class="checkbox-grid">${stagesCatalog.map((s,i)=>`<label class="check-chip"><input type="checkbox" name="stages" value="${s.name}" data-stage-check><span>${s.name.replace('المرحلة ','')}</span></label>`).join('')}</div></div><div class="field full" id="grade-fields"><label>الصفوف التي تدرّسها</label><div class="checkbox-grid">${stagesCatalog.flatMap(s=>s.grades).map(g=>`<label class="check-chip"><input type="checkbox" name="grades" value="${g}"><span>${g}</span></label>`).join('')}</div></div><div class="field"><label>المدرسة الحالية</label><select name="schoolId"><option value="">لا أختار مدرسة</option>${schools}</select><span class="hint">المدارس تُضاف من الإدارة وتظهر هنا تلقائيًا.</span></div><div class="field"><label>خدمات تعليمية</label><input name="services" placeholder="افصل بين الخدمات بفاصلة"></div></div>
     <h2 class="form-section-title">التواصل</h2><div class="form-grid"><div class="field"><label for="apply-phone1">رقم التواصل الأول</label><div class="syria-phone"><span data-phone-prefix-for="1" dir="ltr">+963</span><input id="apply-phone1" name="phone1" type="tel" inputmode="numeric" autocomplete="tel-national" required maxlength="9" minlength="9" pattern="[0-9]{9}" data-syria-phone="1" placeholder="أدخل 9 أرقام" aria-describedby="phone-hint-1"></div><small class="phone-hint" id="phone-hint-1">أدخل 9 أرقام للجوال بعد +963.</small></div><div class="field"><label for="apply-phone-type1">نوع الرقم الأول</label><select id="apply-phone-type1" name="phoneType1" data-phone-type="1"><option value="mobile">جوال</option><option value="whatsapp">واتساب</option><option value="landline">هاتف أرضي</option></select></div><div class="field"><label for="apply-phone2">رقم ثانٍ <span class="hint">اختياري</span></label><div class="syria-phone"><span data-phone-prefix-for="2" dir="ltr">+963</span><input id="apply-phone2" name="phone2" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="9" minlength="9" pattern="[0-9]{9}" data-syria-phone="2" placeholder="أدخل 9 أرقام" aria-describedby="phone-hint-2"></div><small class="phone-hint" id="phone-hint-2">أدخل 9 أرقام للجوال بعد +963.</small></div><div class="field"><label for="apply-phone-type2">نوع الرقم الثاني</label><select id="apply-phone-type2" name="phoneType2" data-phone-type="2"><option value="whatsapp">واتساب</option><option value="mobile">جوال</option><option value="landline">هاتف أرضي</option></select></div></div>
     <div class="form-footer"><span class="consent">بإرسال الطلب، توافق على عرض بيانات البطاقة التي اخترت نشرها للزوار بعد مراجعتها.</span><button class="btn btn-primary" type="submit">إرسال الطلب للمراجعة <span>←</span></button></div>`;
 }
-function memorialForm() { return `<h2 class="form-section-title">بطاقة وفاء</h2><p class="field-hint" style="font-size:12px;color:#8291a0;line-height:1.8;margin:-5px 0 17px">أرسل صورة جميلة ونبذة عن المعلم أو المعلمة الراحلين. ستراجع الإدارة الطلب قبل نشره. لا يُنشأ رمز تعديل لهذه البطاقة.</p><div class="form-grid"><div class="field full"><label>اسم المعلم أو المعلمة</label><input name="memorialName" required maxlength="200" placeholder="الاسم الذي سيظهر على البطاقة"></div><div class="field full"><label>الصورة <span class="hint">اختيارية لكن يفضّل إضافتها</span></label><label class="upload-box"><span class="upload-symbol">▧</span><span><strong>اختر صورة مناسبة</strong><small>قصّ طولي 4:5 قبل الرفع لتناسب بطاقة الوفاء</small></span><input name="photo" type="file" accept="image/*" data-photo-input data-crop-ratio="0.8"></label></div><div class="field full"><label>نبذة عنه أو عنها</label><textarea name="memorialBio" required maxlength="1000" placeholder="اكتب نبذة قصيرة عن مسيرته وأثره في طلابه والمجتمع"></textarea></div><div class="field"><label>اسم مقدّم الطلب</label><input name="submitter" placeholder="اختياري"></div><div class="field"><label>رقم للتواصل عند الحاجة</label><input name="submitterPhone" placeholder="اختياري"></div></div><div class="form-footer"><span class="consent">تُعرض البطاقة بعد مراجعة الإدارة واعتمادها.</span><button class="btn btn-primary" type="submit">إرسال للمراجعة <span>←</span></button></div>`; }
+function memorialForm() { return `<h2 class="form-section-title">بطاقة وفاء</h2><p class="field-hint" style="font-size:12px;color:#8291a0;line-height:1.8;margin:-5px 0 17px">أرسل صورة جميلة ونبذة عن المعلم أو المعلمة الراحلين. ستراجع الإدارة الطلب قبل نشره. لا يُنشأ رمز تعديل لهذه البطاقة.</p><div class="form-grid"><div class="field full"><label>اسم المعلم أو المعلمة</label><input name="memorialName" required minlength="2" maxlength="200" placeholder="الاسم الذي سيظهر على البطاقة"></div><div class="field full"><label>الصورة <span class="hint">اختيارية لكن يفضّل إضافتها</span></label><label class="upload-box"><span class="upload-symbol">▧</span><span><strong>اختر صورة مناسبة</strong><small>قصّ طولي 4:5 قبل الرفع لتناسب بطاقة الوفاء</small></span><input name="photo" type="file" accept="image/*" data-photo-input data-crop-ratio="0.8"></label><div class="application-photo-preview" data-application-photo-preview hidden><img alt="معاينة صورة بطاقة الوفاء"><button type="button" class="photo-remove-button" data-remove-application-photo aria-label="إزالة الصورة">×</button><span>معاينة الصورة المختارة</span></div></div><div class="field full"><label>نبذة عنه أو عنها</label><textarea name="memorialBio" required minlength="10" maxlength="1000" placeholder="اكتب نبذة قصيرة عن مسيرته وأثره في طلابه والمجتمع"></textarea></div><div class="field"><label>اسم مقدّم الطلب</label><input name="submitter" placeholder="اختياري"></div><div class="field"><label>رقم للتواصل عند الحاجة</label><input name="submitterPhone" placeholder="اختياري"></div></div><div class="form-footer"><span class="consent">تُعرض البطاقة بعد مراجعة الإدارة واعتمادها.</span><button class="btn btn-primary" type="submit">إرسال للمراجعة <span>←</span></button></div>`; }
 function renderApply() {
-  return `${pageHero('أضف صوتًا جديدًا للدليل','اختر نوع الطلب، واملأ المعلومات التي ترغب بمشاركتها مع أهل الضمير.','＋')}<section class="section"><div class="container form-layout"><form class="form-card" id="apply-form"><div class="form-choice"><button type="button" class="choice-card ${teacherFormMode==='teacher'?'selected':''}" data-form-mode="teacher"><span class="choice-emoji">♙</span><span><strong>معلم أو معلمة</strong><small>بطاقة تعليمية قابلة للإدارة</small></span></button><button type="button" class="choice-card ${teacherFormMode==='memorial'?'selected':''}" data-form-mode="memorial"><span class="choice-emoji">✦</span><span><strong>معلم راحل</strong><small>بطاقة تذكارية للمراجعة</small></span></button></div>${teacherFormMode==='teacher'?teacherForm():memorialForm()}<div id="form-result"></div></form><aside class="side-card"><h3>كيف يعمل الطلب؟</h3><p>يراجع فريق الإدارة المعلومات ثم يعتمد البطاقة أو يرسل لك ملاحظات لاستكمالها.</p><ul class="side-list">${teacherFormMode==='teacher'?'<li>بعد إرسال الطلب يظهر لك رمز من 8 أرقام، احتفظ به.</li><li>بعد اعتماد البطاقة، تستطيع تعديل البيانات المتغيرة وإضافة إعلاناتك.</li><li>تغيير الاسم يحتاج إلى مراجعة الإدارة.</li>':'<li>البطاقة التذكارية لا تحتاج إلى رمز تحكم.</li><li>يُراجع الاسم والصورة والنبذة قبل النشر.</li><li>تظهر البطاقة في قسم «معلمون تركوا أثرًا» بعد الاعتماد.</li>'}</ul><div class="warning-note">${backendConnected?'طلبك يُرسل إلى قاعدة البيانات للمراجعة. إدارة الاعتماد ستُربط بحساب إداري في الخطوة التالية.':'تعذر الاتصال الآن؛ لن يُرسل الطلب حتى يعود الاتصال بقاعدة البيانات.'}</div></aside></div></section>`;
+  return `${pageHero('انضمام لمنصة الضمير التعليمية','قدّم بياناتك الآن ليتم تدقيقها وتجهيز بطاقتك.','＋')}<section class="section"><div class="container form-layout"><form class="form-card" id="apply-form"><div class="form-choice"><button type="button" class="choice-card ${teacherFormMode==='teacher'?'selected':''}" data-form-mode="teacher"><span class="choice-emoji">♙</span><span><strong>معلم أو معلمة</strong><small>بطاقة تعليمية قابلة للإدارة</small></span></button><button type="button" class="choice-card ${teacherFormMode==='memorial'?'selected':''}" data-form-mode="memorial"><span class="choice-emoji">✦</span><span><strong>معلم راحل</strong><small>بطاقة تذكارية للمراجعة</small></span></button></div>${teacherFormMode==='teacher'?'<div class="apply-identity-warning" role="note"><p>سيُحفظ رمز إدارة بطاقتك وإعلاناتك على هذا المتصفح لتعود إليه لاحقًا.</p></div>':''}${teacherFormMode==='teacher'?teacherForm():memorialForm()}<div id="form-result"></div></form><aside class="side-card"><h3>طلب الانضمام</h3><p>املأ البيانات المطلوبة لإرسال طلبك إلى إدارة منصة الضمير التعليمية.</p><ul class="side-list">${teacherFormMode==='teacher'?'<li>بعد الإرسال يظهر رمز تحكم من 8 أرقام ورمز تتبع منفصل.</li><li>تابع حالة الطلب من جدول التتبع أسفل هذه الصفحة.</li><li>بعد اعتماد البطاقة، تستطيع تعديل البيانات المتغيرة وإضافة إعلاناتك.</li>':'<li>البطاقة التذكارية لا تحتاج إلى رمز تحكم.</li><li>يُراجع الاسم والصورة والنبذة قبل النشر.</li><li>سيظهر رمز تتبع مستقل بعد الإرسال لمتابعة النتيجة.</li>'}</ul><a class="btn btn-outline btn-small" href="#tracking">الانتقال إلى تتبع الطلبات ↓</a><div class="warning-note">${backendConnected?'يُرسل الطلب إلى قاعدة البيانات للمراجعة.':'تعذر الاتصال الآن؛ لن يُرسل الطلب حتى يعود الاتصال بقاعدة البيانات.'}</div></aside></div><div class="container tracking-section" id="tracking"><div class="tracking-heading"><div><h2>تتبع طلباتي</h2><p>تُحفظ المسودة ورموز التحكم والتتبع على هذا المتصفح. بعد قبول الطلب يُخفى رمز التتبع.</p></div><button class="btn btn-outline btn-small" type="button" data-refresh-all-tracking>تحديث الحالات</button></div><form class="tracking-lookup" id="tracking-lookup-form"><label for="tracking-code-input">لديك رمز تتبع؟</label><div><input id="tracking-code-input" name="trackingCode" inputmode="text" autocomplete="off" maxlength="16" minlength="16" pattern="[A-Fa-f0-9]{16}" placeholder="مثال: 5A0B91D4C77E20F3" required><button class="btn btn-primary btn-small" type="submit">إضافة طلب للمتابعة</button></div><small>أدخل رمز التتبع الذي ظهر عند الإرسال إذا كنت تستخدم متصفحًا آخر أو حذفت بيانات المتصفح.</small></form>${renderSavedTeacherCodes()}<div id="tracking-table-container"></div></div></section>`;
 }
 function renderManage() {
   const teacher=teacherById(managingTeacherId);
@@ -266,7 +470,8 @@ function renderManage() {
 function adminStats() { return `<div class="dashboard-cards"><div class="dash-stat"><span>طلبات المعلمين المعلّقة</span><strong>${db.teacherRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>بطاقات تذكارية للمراجعة</span><strong>${db.memorialRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>البطاقات المنشورة</span><strong>${db.teachers.filter(t=>t.approved).length+db.memorials.filter(m=>m.approved).length}</strong></div></div>`; }
 function renderRequestCard(req,kind) {
   const isMem=kind==='memorial'; const data=req.data||{}; const statusLabel={pending:'بانتظار المراجعة',needs_changes:'بحاجة لاستكمال',approved:'معتمد',rejected:'مرفوض'}[req.status]||'قيد المراجعة';
-  return `<article class="request-card"><div class="request-top"><div><h3>${escapeHtml(data.name)} ${isMem?'— بطاقة تذكارية':''}</h3><span class="request-date">وصل ${fmtDate(req.createdAt)}</span></div><span class="status-pill ${req.status}">${statusLabel}</span></div>${data.photo?`<img class="request-photo" src="${escapeHtml(data.photo)}" alt="صورة ${escapeHtml(data.name)}" loading="lazy">`:''}<div class="request-details">${isMem?`<span class="tag">${escapeHtml(data.submitter||'مقدّم طلب غير محدد')}</span>`:`<span class="tag">${data.gender==='female'?'معلمة':'معلم'}</span><span class="tag">${data.status==='retired'?'متقاعد':'على رأس العمل'}</span><span class="tag">${escapeHtml((data.subjects||[]).join('، ')||'دون مواد')}</span>`}</div><p style="font-size:11px;line-height:1.8;color:#78899a;margin:8px 0">${escapeHtml(isMem?data.bio:data.bio||'')}</p><textarea class="review-box" data-review-message="${req.id}" placeholder="اكتب رسالة للمتقدم عند طلب استكمال أو رفض">${escapeHtml(req.message||'')}</textarea><div class="request-actions"><button class="btn btn-primary btn-small" data-review="approve" data-id="${req.id}" data-kind="${kind}">اعتماد ونشر</button><button class="btn btn-outline btn-small" data-review="needs_changes" data-id="${req.id}" data-kind="${kind}">طلب استكمال</button><button class="btn btn-danger btn-small" data-review="reject" data-id="${req.id}" data-kind="${kind}">رفض الطلب</button></div></article>`;
+  const education=(label,items)=>`<div class="request-education-row"><strong>${label}</strong><div class="request-education-values">${items.length?items.map(item=>`<span>${escapeHtml(item)}</span>`).join(''):'<span class="request-education-empty">لم يحدد</span>'}</div></div>`;
+  return `<article class="request-card"><div class="request-top"><div><h3>${escapeHtml(data.name)} ${isMem?'— بطاقة تذكارية':''}</h3><span class="request-date">وصل ${fmtDate(req.createdAt)}</span></div><span class="status-pill ${req.status}">${statusLabel}</span></div>${data.photo?`<img class="request-photo" src="${escapeHtml(data.photo)}" alt="صورة ${escapeHtml(data.name)}" loading="lazy">`:''}<div class="request-details">${isMem?`<span class="tag">${escapeHtml(data.submitter||'مقدّم طلب غير محدد')}</span>`:`<span class="tag">${data.gender==='female'?'معلمة':'معلم'}</span><span class="tag">${data.status==='retired'?'متقاعد':'على رأس العمل'}</span>`}</div>${!isMem?`<div class="request-education">${education('المواد',Array.isArray(data.subjects)?data.subjects:[])}${education('المراحل',Array.isArray(data.stages)?data.stages:[])}${education('الصفوف',Array.isArray(data.grades)?data.grades:[])}</div>`:''}<p style="font-size:11px;line-height:1.8;color:#78899a;margin:8px 0">${escapeHtml(isMem?data.bio:data.bio||'')}</p><textarea class="review-box" data-review-message="${req.id}" placeholder="اكتب رسالة للمتقدم عند طلب استكمال أو رفض">${escapeHtml(req.message||'')}</textarea><div class="request-actions"><button class="btn btn-primary btn-small" data-review="approve" data-id="${req.id}" data-kind="${kind}">اعتماد ونشر</button><button class="btn btn-outline btn-small" data-review="needs_changes" data-id="${req.id}" data-kind="${kind}">طلب استكمال</button><button class="btn btn-danger btn-small" data-review="reject" data-id="${req.id}" data-kind="${kind}">رفض الطلب</button></div></article>`;
 }
 function renderAdmin() {
   if(!adminAccessToken) return `${pageHero('دخول الإدارة','سجّل الدخول بحساب الإدارة المرتبط بمنصة الضمير التعليمية.','⌘')}<section class="section"><div class="container"><form id="admin-login" class="form-card login-card"><h2 class="form-section-title">تسجيل دخول الإدارة</h2><p style="font-size:12px;color:#7b8c9e;line-height:1.8;margin-top:0">أدخل بيانات حساب الإدارة الذي ربطناه للتو.</p>${adminLoginError?`<div class="notice-error">${escapeHtml(adminLoginError)}</div>`:''}<div class="form-grid"><div class="field full"><label>البريد الإلكتروني</label><input name="email" type="email" autocomplete="username" required></div><div class="field full"><label>كلمة المرور</label><input name="password" type="password" autocomplete="current-password" required></div></div><div class="form-footer"><span class="consent">استخدم كلمة مرور حساب Supabase Auth.</span><button class="btn btn-primary" type="submit">دخول لوحة الإدارة</button></div></form></div></section>`;
@@ -274,13 +479,26 @@ function renderAdmin() {
   const pendingTeacherRequests=db.teacherRequests.filter(r=>r.status==='pending').length;
   const pendingMemorialRequests=db.memorialRequests.filter(r=>r.status==='pending').length;
   const pendingReviewCount=pendingTeacherRequests+pendingMemorialRequests;
-  const menu=[['overview','نظرة عامة',pendingReviewCount],['teachers','طلبات المعلمين',pendingTeacherRequests],['memorials','البطاقات التذكارية',pendingMemorialRequests],['schools','إدارة المدارس',0],['listings','الإعلانات',0],['codes','رموز المعلمين',0],['featured','اختيارات الرئيسية',0],['slides','السلايدر الرئيسي',0]];
+  const menu=[['overview','نظرة عامة',pendingReviewCount],['teachers','طلبات المعلمين',pendingTeacherRequests],['memorials','البطاقات التذكارية',pendingMemorialRequests],['content','إدارة البطاقات',0],['schools','إدارة المدارس',0],['listings','الإعلانات',0],['codes','رموز المعلمين',0],['featured','اختيارات الرئيسية',0],['slides','السلايدر الرئيسي',0]];
   let panel='';
   if(adminSection==='overview') panel=`<div class="dash-heading"><div><h2>لوحة الإدارة</h2><p>طلبات المراجعة محمّلة مباشرة من قاعدة البيانات.</p></div><button class="btn btn-quiet btn-small" data-admin-logout>تسجيل الخروج</button></div>${adminStats()}<div class="panel-card" style="padding:19px"><h3 style="font-size:15px;color:#234c70;margin:0 0 8px">قائمة المهام</h3><p style="font-size:12px;color:#7e8e9e;line-height:1.8;margin:0">اعتماد الطلب ينشر البطاقة مباشرة. أضف المدارس لتظهر في نموذج المعلمين.</p><div class="count-pills"><button class="count-pill" data-admin-section="teachers">طلبات معلمين <b>${db.teacherRequests.filter(r=>r.status==='pending').length}</b></button><button class="count-pill" data-admin-section="memorials">بطاقات تذكارية <b>${db.memorialRequests.filter(r=>r.status==='pending').length}</b></button></div></div>`;
   if(adminSection==='teachers') panel=`<div class="dash-heading"><div><h2>طلبات المعلمين والمعلمات</h2><p>اعتماد الطلب ينشر البطاقة مباشرة في الدليل.</p></div></div><div class="admin-tabs"><button class="admin-tab ${adminQueue==='teachers'?'active':''}" data-admin-queue="teachers">طلبات جديدة (${db.teacherRequests.filter(r=>r.status==='pending').length})</button><button class="admin-tab ${adminQueue==='teacher-history'?'active':''}" data-admin-queue="teacher-history">السجل</button></div>${(()=>{const rows=adminQueue==='teacher-history'?db.teacherRequests.filter(r=>r.status!=='pending'):db.teacherRequests.filter(r=>r.status==='pending'||r.status==='needs_changes');return rows.length?rows.map(r=>renderRequestCard(r,'teacher')).join(''):emptyState('لا توجد طلبات','ستظهر هنا طلبات المعلمين بعد إرسالها من النموذج.','♙')})()}`;
   if(adminSection==='memorials') panel=`<div class="dash-heading"><div><h2>البطاقات التذكارية</h2><p>مراجعة صور ونبذات المعلمين الراحلين.</p></div></div><div class="admin-tabs"><button class="admin-tab ${adminQueue==='memorials'?'active':''}" data-admin-queue="memorials">طلبات جديدة (${db.memorialRequests.filter(r=>r.status==='pending').length})</button><button class="admin-tab ${adminQueue==='memorial-history'?'active':''}" data-admin-queue="memorial-history">السجل</button></div>${(()=>{const rows=adminQueue==='memorial-history'?db.memorialRequests.filter(r=>r.status!=='pending'):db.memorialRequests.filter(r=>r.status==='pending'||r.status==='needs_changes');return rows.length?rows.map(r=>renderRequestCard(r,'memorial')).join(''):emptyState('لا توجد طلبات تذكارية','تظهر البطاقات المرسلة للمراجعة هنا.','✦')})()}`;
   if(adminSection==='schools') panel=`<div class="dash-heading"><div><h2>إدارة المدارس</h2><p>المدارس المضافة تظهر مباشرة ضمن خيارات المعلمين.</p></div></div><form class="form-card" id="school-add-form" style="margin-bottom:15px;padding:18px"><div class="form-grid"><div class="field"><label>اسم المدرسة</label><input name="name" required></div><div class="field"><label>نوع المدرسة</label><input name="type" placeholder="تعليم أساسي / ثانوي"></div><div class="field"><label>العنوان</label><input name="address"></div><div class="field"><label>هاتف التواصل</label><input name="phone"></div><div class="field"><label>رابط الموقع على الخريطة</label><input name="location" placeholder="https://..."></div><div class="field"><label>واتساب</label><input name="whatsapp"></div><div class="field full"><label>صورة المدرسة <span class="hint">اختيارية</span></label><label class="upload-box"><span class="upload-symbol">▣</span><span><strong>اختر صورة المدرسة</strong><small>قصّ أفقي مناسب للواجهة، وتُضغط الصورة تلقائيًا قبل رفعها</small></span><input type="file" accept="image/*" data-school-photo></label></div></div><div class="form-footer"><span class="consent">لا تنشر معلومات المدرسة إلا بعد التأكد منها.</span><button class="btn btn-primary btn-small" type="submit">إضافة مدرسة</button></div></form>${db.schools.map(s=>`<div class="school-admin-row">${s.image?`<img class="school-admin-photo" src="${escapeHtml(s.image)}" alt="">`:'<span class="school-admin-photo school-admin-photo-empty">▣</span>'}<div><strong>${escapeHtml(s.name)}</strong><small>${escapeHtml(s.address||s.type||'')}</small></div><div class="school-admin-actions"><button class="btn btn-outline btn-small" data-edit-school="${escapeHtml(s.id)}">تعديل</button><button class="btn btn-danger btn-small" data-delete-school="${escapeHtml(s.id)}">حذف</button></div></div>`).join('')}`;
-  if(adminSection==='listings') panel=`<div class="dash-heading"><div><h2>إعلانات الدروس والدورات</h2><p>الإعلانات المنشورة من المعلمين في النسخة التجريبية.</p></div></div>${db.listings.filter(l=>l.status==='published').length?db.listings.filter(l=>l.status==='published').map(l=>{const t=teacherById(l.teacherId);return `<div class="school-admin-row"><div><strong>${escapeHtml(l.title)}</strong><small>${escapeHtml(t?.name||'')} · ${l.type==='course'?'دورة':'درس خصوصي'}</small></div><button class="btn btn-danger btn-small" data-admin-delete-listing="${l.id}">إخفاء الإعلان</button></div>`}).join(''):emptyState('لا توجد إعلانات','ستظهر هنا إعلانات المعلمين.')}`;
+  if(adminSection==='listings') panel=`<div class="dash-heading"><div><h2>إعلانات الدروس والدورات</h2><p>الإعلانات المنشورة من المعلمين.</p></div></div>${db.listings.filter(l=>l.status==='published').length?db.listings.filter(l=>l.status==='published').map(l=>{const t=teacherById(l.teacherId);return `<div class="school-admin-row"><div><strong>${escapeHtml(l.title)}</strong><small>${escapeHtml(t?.name||'')} · ${l.type==='course'?'دورة':'درس خصوصي'}</small></div><button class="btn btn-outline btn-small" data-admin-visibility="listing" data-id="${l.id}" data-visible="false">إخفاء الإعلان</button></div>`}).join(''):emptyState('لا توجد إعلانات','ستظهر هنا إعلانات المعلمين.')}`;
+  if(adminSection==='content') {
+    const labels={teachers:'المعلمون والمعلمات',memorials:'المعلمون الراحلون',listings:'الدورات والدروس'};
+    const rows=adminContentRows[adminContentKind]||[];
+    const cards=rows.length?rows.map(item=>{
+      const name=adminContentKind==='teachers'?item.full_name:adminContentKind==='memorials'?item.full_name:item.title;
+      const status=adminContentKind==='listings'?item.status:item.is_published?'published':'hidden';
+      const detail=adminContentKind==='teachers'?`${item.gender==='female'?'معلمة':'معلم'} · ${item.employment_status==='retired'?'متقاعد':'على رأس العمل'}`:adminContentKind==='memorials'?'بطاقة تذكارية':`${escapeHtml(item.teacher_name||'')} · ${item.listing_type==='course'?'دورة':'درس خصوصي'}`;
+      const image=item.image_url||item.photo_url||'';
+      const visibility=adminContentKind==='listings'?status==='published':status==='published';
+      return `<div class="admin-content-row">${image?`<img src="${escapeHtml(image)}" alt="" loading="lazy">`:'<span class="admin-content-placeholder" aria-hidden="true">✦</span>'}<div class="admin-content-copy"><strong>${escapeHtml(name||'')}</strong><small>${detail}</small><small class="${visibility?'':'is-hidden'}">${visibility?'منشورة':'مخفية'}</small></div><div class="admin-content-actions"><button class="btn btn-outline btn-small" data-admin-visibility="${adminContentKind==='teachers'?'teacher':adminContentKind==='memorials'?'memorial':'listing'}" data-id="${item.id}" data-visible="${visibility?'false':'true'}">${visibility?'إخفاء':'إظهار'}</button><button class="btn btn-danger btn-small" data-admin-delete-content="${adminContentKind==='teachers'?'teacher':adminContentKind==='memorials'?'memorial':'listing'}" data-id="${item.id}">حذف نهائي</button></div></div>`;
+    }).join(''):emptyState('لا توجد بطاقات','لا توجد عناصر في هذا القسم حالياً.');
+    panel=`<div class="dash-heading"><div><h2>إدارة البطاقات والمحتوى</h2><p>أخفِ بطاقة مؤقتًا أو احذفها نهائيًا مع بياناتها وصورها وإعلاناتها التابعة.</p></div></div>${adminContentLoadError?`<div class="notice-error">وظائف إدارة البطاقات غير مفعّلة في Supabase. شغّل ملف <b>supabase-content-admin.sql</b> من SQL Editor ثم أعد تحديث لوحة الإدارة.<small style="display:block;margin-top:6px">${escapeHtml(adminContentLoadError)}</small></div>`:''}<div class="admin-tabs">${Object.entries(labels).map(([kind,label])=>`<button class="admin-tab ${adminContentKind===kind?'active':''}" data-admin-content-kind="${kind}">${label} (${adminContentRows[kind]?.length||0})</button>`).join('')}</div><div class="admin-content-list">${cards}</div>`;
+  }
   if(adminSection==='codes') panel=`<div class="dash-heading"><div><h2>رموز تحكم المعلمين</h2><p>تحقّق من هوية المعلم قبل إصدار رمز بديل. سيظهر الرمز مرة واحدة بعد الحفظ لتسليمه للمعلم.</p></div></div><div class="teacher-code-list">${db.teachers.filter(t=>t.approved).length?db.teachers.filter(t=>t.approved).map(t=>`<div class="teacher-code-row"><div class="teacher-code-info"><strong>${escapeHtml(t.name)}</strong><small>${escapeHtml((t.subjects||[]).join('، ')||'معلم')}</small></div><button class="btn btn-outline btn-small teacher-code-action" data-reset-teacher-code="${escapeHtml(t.id)}"><span aria-hidden="true">↻</span> إصدار رمز جديد</button></div>`).join(''):emptyState('لا توجد بطاقات منشورة','ستظهر بطاقات المعلمين المعتمدة هنا.')}</div>`;
   if(adminSection==='featured') {
     const itemRow=(kind,item,title,detail)=>`<form class="featured-admin-row" data-featured-form data-kind="${kind}" data-id="${escapeHtml(item.id)}"><div class="featured-admin-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></div><label class="featured-admin-badge"><span>شارة اختيارية</span><input name="badge" maxlength="30" placeholder="مثال: اختيار الإدارة" value="${escapeHtml(item.badgeText||'')}"></label><label class="featured-admin-toggle"><input type="checkbox" name="featured" ${item.featured?'checked':''}><span>إبراز</span></label><button type="submit" class="btn btn-primary btn-small">حفظ</button></form>`;
@@ -329,7 +547,9 @@ function render() {
   const featuredSelectionStart=focusedFeaturedSearch?document.activeElement.selectionStart:null;
   const featuredSelectionEnd=focusedFeaturedSearch?document.activeElement.selectionEnd:null;
   const map={home:renderHome,teachers:renderTeachers,lessons:renderLessons,schools:renderSchools,memorials:renderMemorials,apply:renderApply,manage:renderManage,admin:renderAdmin,search:renderSearch};
+  map.prelaunch=renderPrelaunch;
   app.innerHTML=(map[view]||renderHome)();
+  if(view==='apply'){restoreApplyDraft(document.getElementById('apply-form'));renderTrackingTable();}
   document.querySelectorAll('[data-view]').forEach(el=>el.classList.toggle('active',el.dataset.view===view));
   if(focusedHomeFieldName){const restored=document.querySelector('#home-search')?.elements.namedItem(focusedHomeFieldName);restored?.focus({preventScroll:true});if(selectionStart!==null&&typeof restored?.setSelectionRange==='function')restored.setSelectionRange(selectionStart,selectionEnd);}
   if(focusedFeaturedSearch){const restored=document.getElementById('featured-admin-search');restored?.focus({preventScroll:true});if(typeof featuredSelectionStart==='number')restored?.setSelectionRange(featuredSelectionStart,featuredSelectionEnd);}
@@ -389,6 +609,13 @@ function checkedValues(form,name) { return [...form.querySelectorAll(`input[name
 function showApplicationResult(html) { const box=document.getElementById('form-result'); if(box){box.innerHTML=html;box.scrollIntoView({behavior:'smooth',block:'center'});} }
 async function handleTeacherSubmit(form) {
   const values=formValues(form); const code=makeCode();
+  const selectedSubjects=checkedValues(form,'subjects');
+  const selectedStages=checkedValues(form,'stages');
+  const selectedGrades=checkedValues(form,'grades');
+  if(!selectedSubjects.length){toast('اختر مادة واحدة على الأقل.',true);form.querySelector('input[name="subjects"]')?.focus();return;}
+  if(!selectedStages.length){toast('اختر مرحلة واحدة على الأقل.',true);form.querySelector('[data-stage-check]')?.focus();return;}
+  const stagesWithoutGrades=selectedStages.filter(stage=>!stagesCatalog.find(item=>item.name===stage)?.grades.some(grade=>selectedGrades.includes(grade)));
+  if(stagesWithoutGrades.length){const firstGrade=stagesCatalog.find(stage=>stage.name===stagesWithoutGrades[0])?.grades[0];toast(`اختر صفًا واحدًا على الأقل لكل مرحلة: ${stagesWithoutGrades.join('، ')}.`,true);if(firstGrade)form.querySelector(`#grade-fields input[name="grades"][value="${CSS.escape(firstGrade)}"]`)?.focus();return;}
   for(const number of [1,2]){
     const digits=localPhoneDigits(values[`phone${number}`]);const type=values[`phoneType${number}`]||'mobile';
     if(number===1&&!digits){toast('رقم التواصل الأول مطلوب.',true);return;}
@@ -396,20 +623,23 @@ async function handleTeacherSubmit(form) {
     values[`phone${number}`]=digits;
   }
   const contacts=[]; if(values.phone1)contacts.push({type:values.phoneType1,value:formatSyriaPhone(values.phone1,values.phoneType1)}); if(values.phone2)contacts.push({type:values.phoneType2,value:formatSyriaPhone(values.phone2,values.phoneType2)});
-  const request={id:crypto.randomUUID(),createdAt:Date.now(),status:'pending',code,data:{id:crypto.randomUUID(),name:values.name,gender:values.gender,status:values.status,years:Number(values.years)||0,schoolId:values.schoolId||'',address:values.address||'',bio:values.bio||'',subjects:checkedValues(form,'subjects'),stages:checkedValues(form,'stages'),grades:checkedValues(form,'grades'),services:(values.services||'').split(/[،,]/).map(x=>x.trim()).filter(Boolean),contacts,photo:selectedPhoto,approved:false}};
+  const request={id:crypto.randomUUID(),createdAt:Date.now(),status:'pending',code,data:{id:crypto.randomUUID(),name:values.name,gender:values.gender,status:values.status,years:Number(values.years)||0,schoolId:values.schoolId||'',address:values.address||'',bio:values.bio||'',subjects:selectedSubjects,stages:selectedStages,grades:selectedGrades,services:(values.services||'').split(/[،,]/).map(x=>x.trim()).filter(Boolean),contacts,photo:selectedPhoto,approved:false}};
   const button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='جارٍ إرسال الطلب…';
-  let requestId;
-  try { request.data.photo=await uploadImageDataUrl(selectedPhoto,'profiles');requestId=await supabaseRpc('submit_teacher_application',{p_requested_name:request.data.name,p_payload:request.data,p_control_code:code}); }
+  let submission;
+  try { request.data.photo=await uploadImageDataUrl(selectedPhoto,'profiles');submission=await supabaseRpc('submit_teacher_application_v2',{p_requested_name:request.data.name,p_payload:request.data,p_control_code:code}); }
   catch(error){button.disabled=false;button.textContent='إرسال الطلب للمراجعة';toast(error.message||'تعذر إرسال الطلب.',true);return;}
-  try { const saved=JSON.parse(localStorage.getItem('dameer-teacher-controls-v1')||'{}');saved[String(request.data.name).trim().toLocaleLowerCase('ar')]={name:request.data.name,code,requestId};localStorage.setItem('dameer-teacher-controls-v1',JSON.stringify(saved)); } catch {}
-  showApplicationResult(`<div class="notice-success"><strong>استلمنا طلبك للمراجعة.</strong><br>احتفظ برمز التحكم الظاهر أدناه. بعد اعتماد البطاقة، استخدم الاسم والرمز لإدارة معلوماتك وإعلاناتك.</div><div class="code-display"><small>رمز التحكم الخاص بك — احتفظ به</small><strong>${code}</strong><button class="btn btn-glass btn-small" type="button" data-copy-code="${code}">نسخ الرمز</button></div><p class="consent">حُفظ الطلب في قاعدة البيانات، وحُفظ الرمز كتجزئة لا يمكن قراءتها من الجداول العامة. مراجعة الإدارة قيد الربط.</p>`); form.querySelector('button[type="submit"]').disabled=true;
+  try { const saved=JSON.parse(localStorage.getItem('dameer-teacher-controls-v1')||'{}');saved[String(request.data.name).trim().toLocaleLowerCase('ar')]={name:request.data.name,code,requestId:submission.id};localStorage.setItem('dameer-teacher-controls-v1',JSON.stringify(saved)); } catch {}
+  trackedApplications.unshift({code:submission.tracking_code,kind:'teacher',name:request.data.name,createdAt:new Date().toISOString(),status:'pending',message:''});saveTrackedApplications();clearApplyDraft();
+  showApplicationResult(`<div class="notice-success"><strong>استلمنا طلبك للمراجعة.</strong><br>احتفظ برمز التحكم لإدارة البطاقة، وبرمز التتبع لمتابعة قرار الإدارة.</div><div class="code-display"><small>رمز التحكم — لتعديل البطاقة بعد اعتمادها</small><strong>${code}</strong><button class="btn btn-glass btn-small" type="button" data-copy-code="${code}">نسخ الرمز</button></div><div class="code-display tracking-code-display"><small>رمز التتبع — لمعرفة حالة الطلب فقط</small><strong dir="ltr">${escapeHtml(submission.tracking_code)}</strong><button class="btn btn-glass btn-small" type="button" data-copy-code="${escapeHtml(submission.tracking_code)}">نسخ رمز التتبع</button><a class="btn btn-glass btn-small" href="#tracking">عرض حالة الطلب</a></div><p class="consent">أُضيف طلبك تلقائيًا إلى جدول التتبع أدناه، وحُفظ رمز التتبع في هذا المتصفح.</p>`); form.querySelector('button[type="submit"]').disabled=true;
 }
 async function handleMemorialSubmit(form) {
   const v=formValues(form); const request={id:crypto.randomUUID(),createdAt:Date.now(),status:'pending',data:{name:v.memorialName,bio:v.memorialBio,submitter:v.submitter||'',phone:v.submitterPhone||'',photo:selectedPhoto}};
   const button=form.querySelector('button[type="submit"]');button.disabled=true;button.textContent='جارٍ إرسال الطلب…';
-  try { request.data.photo=await uploadImageDataUrl(selectedPhoto,'memorials');await supabaseRpc('submit_memorial_application',{p_full_name:request.data.name,p_biography:request.data.bio,p_photo_url:request.data.photo||null,p_submitted_by:request.data.submitter||null,p_submitter_contact:request.data.phone||null}); }
+  let submission;
+  try { request.data.photo=await uploadImageDataUrl(selectedPhoto,'memorials');submission=await supabaseRpc('submit_memorial_application_v2',{p_full_name:request.data.name,p_biography:request.data.bio,p_photo_url:request.data.photo||null,p_submitted_by:request.data.submitter||null,p_submitter_contact:request.data.phone||null}); }
   catch(error){button.disabled=false;button.textContent='إرسال البطاقة للمراجعة';toast(error.message||'تعذر إرسال الطلب.',true);return;}
-  showApplicationResult('<div class="notice-success"><strong>وصلت البطاقة التذكارية إلى قائمة المراجعة.</strong><br>ستنشر بعد اعتمادها من الإدارة، ولا تحتاج إلى رمز تحكم.</div><p class="consent">حُفظ طلبك في قاعدة البيانات. لوحة مراجعة الإدارة ستُربط في الخطوة التالية.</p>');button.disabled=true;
+  trackedApplications.unshift({code:submission.tracking_code,kind:'memorial',name:request.data.name,createdAt:new Date().toISOString(),status:'pending',message:''});saveTrackedApplications();clearApplyDraft();
+  showApplicationResult(`<div class="notice-success"><strong>وصلت البطاقة التذكارية إلى قائمة المراجعة.</strong><br>ستنشر بعد اعتمادها من الإدارة، ولا تحتاج إلى رمز تحكم.</div><div class="code-display tracking-code-display"><small>رمز التتبع — لمعرفة حالة الطلب</small><strong dir="ltr">${escapeHtml(submission.tracking_code)}</strong><button class="btn btn-glass btn-small" type="button" data-copy-code="${escapeHtml(submission.tracking_code)}">نسخ الرمز</button><a class="btn btn-glass btn-small" href="#tracking">عرض حالة الطلب</a></div><p class="consent">أُضيف الطلب تلقائيًا إلى جدول التتبع، وحُفظ الرمز في هذا المتصفح.</p>`);button.disabled=true;
 }
 function approveRequest(id,kind) {
   const list=kind==='memorial'?db.memorialRequests:db.teacherRequests; const req=list.find(x=>x.id===id); if(!req)return;
@@ -469,14 +699,14 @@ async function loginTeacher(form) {
     managingTeacherId=found.id;managingTeacherCode=values.code;manageError='';setView('manage');
   } catch(error) {manageError=error.message||'تعذّر التحقق من الرمز.';button.disabled=false;button.textContent='متابعة ←';render();}
 }
-function logoutAdmin(){adminAccessToken='';adminQueueLoaded=false;adminLoginError='';sessionStorage.removeItem('dameer-admin-token-v1');render();}
+function logoutAdmin(){clearAdminSession();adminQueueLoaded=false;adminLoginError='';render();}
 function openTeacher(id) {
   const t=teacherById(id);if(!t)return;const school=schoolById(t.schoolId);
   const contacts=(t.contacts||[]).map(c=>`<a class="btn btn-outline btn-small" href="${c.type==='whatsapp'?`https://wa.me/${c.value.replace(/\D/g,'')}`:`tel:${escapeHtml(c.value)}`}" target="${c.type==='whatsapp'?'_blank':'_self'}" rel="noopener">${c.type==='whatsapp'?'راسل عبر واتساب':c.type==='landline'?'اتصال أرضي':'اتصال بالجوال'}</a>`).join('');
   modalRoot.innerHTML=`<div class="modal-backdrop" data-close-modal><section class="modal" role="dialog" aria-modal="true" aria-label="بطاقة المعلم"><button class="modal-close" data-close-modal aria-label="إغلاق">×</button><div class="modal-head">${avatarMarkup(t)}<div><h2>${escapeHtml(t.name)}</h2><div class="teacher-subject">${escapeHtml((t.subjects||[]).join('، '))}</div><div class="teacher-meta">${t.status==='retired'?'<span class="tag retired">متقاعد</span>':''}<span class="tag gender">${t.gender==='female'?'معلمة':'معلم'}</span>${school?`<span class="tag">${escapeHtml(school.name)}</span>`:''}</div></div></div><div class="modal-section"><h3>نبذة مختصرة</h3><p>${escapeHtml(t.bio||'لا توجد نبذة مضافة.')}</p></div><div class="modal-section"><h3>المراحل والصفوف</h3><p>${escapeHtml([...(t.stages||[]),...(t.grades||[])].join(' · ')||'لم تحدد')}</p></div><div class="modal-section"><h3>الخبرة والخدمات</h3><p>${t.years?`${t.years} سنة خبرة`:''} ${(t.services||[]).length?'· '+escapeHtml(t.services.join('، ')):''}</p></div>${t.address?`<div class="modal-section"><h3>العنوان</h3><p>${escapeHtml(t.address)}</p></div>`:''}<div class="modal-actions">${contacts}<button class="btn btn-primary btn-small" data-share-teacher="${t.id}">مشاركة البطاقة</button><button class="btn btn-quiet btn-small" data-download-card="${t.id}">تنزيل البطاقة كصورة</button></div></section></div>`;
 }
-async function shareTeacher(id) { const t=teacherById(id);if(!t)return;const url=`${location.origin}${location.pathname}?teacher=${encodeURIComponent(id)}`;try{if(navigator.share)await navigator.share({title:`بطاقة ${t.name} — دليل الضمير`,text:`${t.name} — ${t.subjects.join('، ')}`,url});else{await navigator.clipboard.writeText(url);toast('نُسخ رابط البطاقة.');}}catch(err){if(err.name!=='AbortError')toast('تعذرت مشاركة الرابط.',true);} }
-function downloadCard(id) {
+async function shareTeacher(id) { const t=teacherById(id);if(!t)return;const url=`${location.origin}${location.pathname}?teacher=${encodeURIComponent(id)}`;try{if(navigator.share)await navigator.share({title:`بطاقة ${t.name} — منصة الضمير التعليمية`,text:`${t.name} — ${t.subjects.join('، ')}`,url});else{await navigator.clipboard.writeText(url);toast('نُسخ رابط البطاقة.');}}catch(err){if(err.name!=='AbortError')toast('تعذرت مشاركة الرابط.',true);} }
+async function downloadCard(id) {
   const t=teacherById(id);if(!t)return;const canvas=document.createElement('canvas');canvas.width=1080;canvas.height=1350;const ctx=canvas.getContext('2d');
   const bg=ctx.createLinearGradient(0,0,1080,1350);bg.addColorStop(0,'#0a2d55');bg.addColorStop(.6,'#115b91');bg.addColorStop(1,'#dceffc');ctx.fillStyle=bg;ctx.fillRect(0,0,1080,1350);
   ctx.fillStyle='rgba(255,255,255,.1)';ctx.beginPath();ctx.arc(150,160,280,0,Math.PI*2);ctx.fill();ctx.beginPath();ctx.arc(950,1180,320,0,Math.PI*2);ctx.fill();
@@ -487,7 +717,12 @@ function downloadCard(id) {
   ctx.font='500 28px IBM Plex Sans Arabic, sans-serif';ctx.fillStyle='#fff';if(school)ctx.fillText(`المدرسة: ${school.name}`,540,745);if(contact)ctx.fillText(`${contactLabel}: ${contact.value}`,540,school?805:745);
   ctx.font='400 25px IBM Plex Sans Arabic, sans-serif';ctx.fillStyle='#eef7ff';const bio=(t.bio||'').trim();wrapCanvas(ctx,bio.length>180?`${bio.slice(0,177).trimEnd()}…`:bio,540,contact||school?890:800,880,43);
   ctx.fillStyle='#fff';ctx.font='500 24px IBM Plex Sans Arabic, sans-serif';ctx.fillText(`${t.status==='retired'?'متقاعد · ':''}${t.years||0} سنة خبرة`,540,1190);
-  const a=document.createElement('a');a.download=`بطاقة-${t.name.replace(/\s+/g,'-')}.png`;a.href=canvas.toDataURL('image/png');a.click();toast('تم تنزيل البطاقة كصورة.');
+  // JPEG is broadly supported by desktop image viewers. Use a Blob URL instead of
+  // a data URI, which some browsers/download handlers have saved with bad metadata.
+  const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.94));
+  if(!blob||blob.type!=='image/jpeg'||blob.size<1000){toast('تعذر تجهيز ملف صورة البطاقة. أعد المحاولة أو حدّث الصفحة.',true);return;}
+  const safeName=(t.name||'معلم').trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-').replace(/\s+/g,'-').slice(0,80)||'معلم';
+  const url=URL.createObjectURL(blob),a=document.createElement('a');a.download=`بطاقة-${safeName}.jpg`;a.href=url;a.style.display='none';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);toast('تم تنزيل بطاقة المعلم بصيغة JPG المتوافقة مع برامج الصور.');
 }
 function listingImageBlob(listing){
   const teacher=teacherById(listing.teacherId);const canvas=document.createElement('canvas');canvas.width=1080;canvas.height=1350;const ctx=canvas.getContext('2d');
@@ -600,12 +835,14 @@ function listingDialog(teacher, listing=null) {
 
 document.addEventListener('click',event=>{
   const searchType=event.target.closest('[data-search-type]');if(searchType){const next=searchType.dataset.searchType;searchResultFilter=searchResultFilter===next?'all':next;searchLimit=20;render();return;}
+  if(event.target.closest('[data-retry-content]')){void hydrateFromSupabase();return;}
   const cropAccept=event.target.closest('[data-crop-accept]');if(cropAccept&&photoCrop){const crop=photoCrop,data=crop.getDataUrl();photoCrop=null;modalRoot.innerHTML='';crop.onComplete(data);return;}
+  const removeApplicationPhoto=event.target.closest('[data-remove-application-photo]');if(removeApplicationPhoto){const form=removeApplicationPhoto.closest('#apply-form');selectedPhoto='';if(applyDraft?.mode===teacherFormMode)applyDraft.photo='';const input=form?.querySelector('[data-photo-input]');if(input)input.value='';updateApplyPhotoPreview(form,'');saveApplyDraft(form);return;}
   const cropCancel=event.target.closest('[data-crop-cancel]');if(cropCancel&&photoCrop){photoCrop.inputElement.value='';photoCrop=null;modalRoot.innerHTML='';return;}
   const viewBtn=event.target.closest('[data-view]');if(viewBtn){if(viewBtn.dataset.formKind)teacherFormMode=viewBtn.dataset.formKind;setView(viewBtn.dataset.view);return;}
   const mode=event.target.closest('[data-form-mode]');if(mode){teacherFormMode=mode.dataset.formMode;selectedPhoto='';render();return;}
   const slide=event.target.closest('[data-slide]');if(slide){heroIndex=Number(slide.dataset.slide);render();return;}
-  if(event.target.closest('[data-slide-next]')){heroIndex=(heroIndex+1)%slides.length;render();return;}
+  if(event.target.closest('[data-slide-next]')){if(!slides.length)return;heroIndex=(heroIndex+1)%slides.length;render();return;}
   if(event.target.closest('[data-load-more]')){searchLimit+=20;render();return;}
   const teacher=event.target.closest('[data-open-teacher]');if(teacher){openTeacher(teacher.dataset.openTeacher);return;}
   const share=event.target.closest('[data-share-teacher]');if(share){event.stopPropagation();shareTeacher(share.dataset.shareTeacher);return;}
@@ -614,6 +851,14 @@ document.addEventListener('click',event=>{
   const closeTarget=event.target.closest('[data-close-modal]');if(closeTarget&&(event.target===closeTarget||event.target.matches('button[data-close-modal]'))){if(photoCrop?.inputElement)photoCrop.inputElement.value='';photoCrop=null;modalRoot.innerHTML='';return;}
   const staff=event.target.closest('[data-school-staff]');if(staff){const s=schoolById(staff.dataset.schoolStaff);const teachers=db.teachers.filter(t=>t.schoolId===s?.id&&t.approved);modalRoot.innerHTML=`<div class="modal-backdrop" data-close-modal><section class="modal"><button class="modal-close" data-close-modal>×</button><h2>كادر ${escapeHtml(s?.name||'المدرسة')}</h2><p>${teachers.length?`<div class="teacher-grid">${teachers.map(teacherCard).join('')}</div>`:'لا توجد بطاقات معلمين مرتبطة بهذه المدرسة بعد.'}</p></section></div>`;return;}
   const adminSectionBtn=event.target.closest('[data-admin-section]');if(adminSectionBtn){adminSection=adminSectionBtn.dataset.adminSection;render();return;}
+  const adminContentTab=event.target.closest('[data-admin-content-kind]');if(adminContentTab){adminContentKind=adminContentTab.dataset.adminContentKind;render();return;}
+  const adminVisibility=event.target.closest('[data-admin-visibility]');if(adminVisibility){void setAdminContentVisibility(adminVisibility.dataset.adminVisibility,adminVisibility.dataset.id,adminVisibility.dataset.visible==='true',adminVisibility);return;}
+  const cancelAdminDelete=event.target.closest('[data-cancel-admin-delete]');if(cancelAdminDelete||event.target.matches('[data-close-admin-delete]')){modalRoot.innerHTML='';return;}
+  const confirmAdminDelete=event.target.closest('[data-confirm-admin-delete]');if(confirmAdminDelete){void executeAdminContentDeletion(confirmAdminDelete.dataset.confirmAdminDelete,confirmAdminDelete.dataset.id,confirmAdminDelete);return;}
+  const adminDeleteContent=event.target.closest('[data-admin-delete-content]');if(adminDeleteContent){void deleteAdminContent(adminDeleteContent.dataset.adminDeleteContent,adminDeleteContent.dataset.id,adminDeleteContent);return;}
+  const trackingRefresh=event.target.closest('[data-check-tracking]');if(trackingRefresh){trackingRefresh.disabled=true;void lookupTrackingCode(trackingRefresh.dataset.checkTracking).then(()=>toast('تم تحديث حالة الطلب.')).catch(error=>toast(error.message,true)).finally(()=>{if(trackingRefresh.isConnected)trackingRefresh.disabled=false;});return;}
+  if(event.target.closest('[data-refresh-all-tracking]')){void refreshTrackedApplications().then(failed=>toast(failed?'تعذر تحديث بعض الطلبات. شغّل ترحيل تتبع الطلبات ثم أعد المحاولة.':'تم تحديث حالات الطلبات المحفوظة.',Boolean(failed)));return;}
+  const trackingRemove=event.target.closest('[data-remove-tracking]');if(trackingRemove){trackedApplications=trackedApplications.filter(item=>item.code!==trackingRemove.dataset.removeTracking);saveTrackedApplications();return;}
   if(event.target.closest('[data-add-slide]')){slideDialog();return;}
   const editSlideButton=event.target.closest('[data-edit-slide]');if(editSlideButton){slideDialog(editSlideButton.dataset.editSlide);return;}
   const deleteSlideButton=event.target.closest('[data-delete-slide]');if(deleteSlideButton){void deleteHomepageSlide(deleteSlideButton.dataset.deleteSlide,deleteSlideButton);return;}
@@ -630,7 +875,6 @@ document.addEventListener('click',event=>{
   const bump=event.target.closest('[data-bump-listing]');if(bump){void bumpTeacherListing(bump.dataset.bumpListing,bump);return;}
   const deleteSchoolButton=event.target.closest('[data-delete-school]');if(deleteSchoolButton){void deleteSchool(deleteSchoolButton.dataset.deleteSchool,deleteSchoolButton);return;}
   const editSchoolButton=event.target.closest('[data-edit-school]');if(editSchoolButton){editSchoolDialog(editSchoolButton.dataset.editSchool);return;}
-  const adminDel=event.target.closest('[data-admin-delete-listing]');if(adminDel){const l=db.listings.find(x=>x.id===adminDel.dataset.adminDeleteListing);if(l)l.status='hidden';persist();render();toast('تم إخفاء الإعلان.');return;}
   const mobile=event.target.closest('.mobile-menu');if(mobile){const nav=document.querySelector('.main-nav');const open=nav.classList.toggle('open');mobile.setAttribute('aria-expanded',String(open));return;}
   if(event.target.classList.contains('modal-backdrop'))modalRoot.innerHTML='';
 });
@@ -654,6 +898,9 @@ document.addEventListener('input',event=>{
   }
 });
 
+document.addEventListener('input',event=>{const form=event.target.closest('#apply-form');if(form)saveApplyDraft(form);});
+document.addEventListener('change',event=>{const form=event.target.closest('#apply-form');if(form)saveApplyDraft(form);});
+
 document.addEventListener('change',event=>{
   if(event.target.matches('[data-phone-type]')){const form=event.target.closest('#apply-form');if(form)syncSyriaPhoneField(form,event.target.dataset.phoneType);return;}
   if(event.target.id==='featured-admin-sort'){featuredAdminSort=event.target.value;render();return;}
@@ -662,13 +909,12 @@ document.addEventListener('change',event=>{
     const dateLabel=modalRoot.querySelector('[data-start-date-label]');
     if(dateLabel)dateLabel.textContent=event.target.value==='course'?'تاريخ بدء الدورة':'تاريخ بدء الدروس الخصوصية';
   }
-  if(event.target.matches('[data-photo-input]'))openPhotoCrop(event.target.files?.[0],Number(event.target.dataset.cropRatio)||1,data=>{selectedPhoto=data;const label=event.target.closest('.upload-box');if(label){let prev=label.querySelector('.upload-preview');if(data){if(!prev){prev=document.createElement('img');prev.className='upload-preview';label.prepend(prev);}prev.className=`upload-preview crop-preview ${Number(event.target.dataset.cropRatio)===1?'crop-preview-square':'crop-preview-portrait'}`;prev.src=data;}}},event.target);
+  if(event.target.matches('[data-photo-input]'))openPhotoCrop(event.target.files?.[0],Number(event.target.dataset.cropRatio)||1,data=>{selectedPhoto=data;const form=event.target.closest('#apply-form');updateApplyPhotoPreview(form,data);saveApplyDraft(form);},event.target);
   if(event.target.matches('[data-listing-photo]'))imageData(event.target.files?.[0],data=>{selectedListingPhoto=data;const label=event.target.closest('.upload-box');if(label){let prev=label.querySelector('.upload-preview');if(data){if(!prev){prev=document.createElement('img');prev.className='upload-preview';label.prepend(prev);}prev.src=data;}}});
   if(event.target.matches('[data-school-photo]'))imageData(event.target.files?.[0],data=>{selectedSchoolPhoto=data;const label=event.target.closest('.upload-box');if(label){let prev=label.querySelector('.upload-preview');if(data){if(!prev){prev=document.createElement('img');prev.className='upload-preview';label.prepend(prev);}prev.className='upload-preview school-upload-preview';prev.src=data;}}});
   if(event.target.matches('[data-slide-photo]'))imageData(event.target.files?.[0],data=>{selectedSlidePhoto=data;const label=event.target.closest('.upload-box');if(label){let prev=label.querySelector('.upload-preview');if(data){if(!prev){prev=document.createElement('img');prev.className='upload-preview';label.prepend(prev);}prev.src=data;}}});
   if(event.target.matches('[data-stage-check]')){
-    const selected=[...document.querySelectorAll('[data-stage-check]:checked')].map(x=>x.value);const allowed=stagesCatalog.filter(s=>selected.includes(s.name)).flatMap(s=>s.grades);
-    document.querySelectorAll('#grade-fields input[name="grades"]').forEach(input=>{const label=input.closest('.check-chip');label.style.display=allowed.length&&!allowed.includes(input.value)?'none':'';if(!allowed.includes(input.value))input.checked=false;});
+    const form=event.target.closest('#apply-form');if(form){syncApplyGradeChoices(form,true);saveApplyDraft(form);}
   }
   if(event.target.id==='listing-type'){
     searchState.listingType=event.target.value;searchLimit=20;render();document.getElementById('listing-type')?.focus({preventScroll:true});
@@ -691,6 +937,10 @@ document.addEventListener('submit',event=>{
     const v=formValues(form);homeSearchDraft={query:v.query||'',mode:v.mode||'all',subject:v.subject||''};searchState={query:homeSearchDraft.query,mode:homeSearchDraft.mode,subject:homeSearchDraft.subject,grade:''};searchResultFilter='all';searchLimit=20;clearTimeout(searchDebounceTimer);render();return;
   }
   if(form.id==='apply-form'){if(teacherFormMode==='teacher')void handleTeacherSubmit(form);else void handleMemorialSubmit(form);return;}
+  if(form.id==='tracking-lookup-form'){
+    const button=form.querySelector('button[type="submit"]'),code=form.elements.trackingCode.value;
+    button.disabled=true;void lookupTrackingCode(code).then(()=>{form.reset();toast('أُضيف الطلب إلى جدول المتابعة.');}).catch(error=>toast(error.message||'تعذر العثور على الطلب.',true)).finally(()=>{if(button.isConnected)button.disabled=false;});return;
+  }
   if(form.id==='manage-login'){
     void loginTeacher(form);return;
   }
@@ -710,10 +960,15 @@ document.addEventListener('click',event=>{
 function renderWithAnchor(){render();const target=new URLSearchParams(location.search).get('teacher');if(target)openTeacher(target);}
 const pageView=document.body.dataset.page;
 const initial=location.hash.replace('#','');
-if(['apply','manage','admin'].includes(pageView))view=pageView;
+const prelaunchHome=pageView==='public'&&window.DAMEER_SUPABASE?.prelaunchMode===true;
+if(prelaunchHome){view='prelaunch';document.body.classList.add('prelaunch-mode');document.title='التسجيل المبكر — منصة الضمير التعليمية';document.querySelector('.header-apply')?.replaceChildren(document.createTextNode('التسجيل المبكر'),Object.assign(document.createElement('span'),{textContent:' ＋'}));}
+else if(['apply','manage','admin'].includes(pageView))view=pageView;
 else if(dedicatedPageFiles[initial])location.replace(`${dedicatedPageFiles[initial]}#${initial}`);
 else if(['home','teachers','lessons','schools','memorials','search'].includes(initial))view=initial;
-renderWithAnchor();
-void hydrateFromSupabase();
+if(prelaunchHome)render();else renderWithAnchor();
+if(!prelaunchHome)void hydrateFromSupabase();
+if(view==='apply')void refreshTrackedApplications();
+setInterval(()=>{if(view==='apply')void refreshTrackedApplications();},60000);
 setInterval(()=>{if(view==='home'&&slides.length){heroIndex=(heroIndex+1)%slides.length;const y=window.scrollY;render();window.scrollTo(0,y);}},6500);
+
 

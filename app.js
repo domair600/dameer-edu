@@ -105,6 +105,7 @@ async function loginAdmin(form) {
   } catch(error){adminLoginError=error.message||'تعذر تسجيل الدخول.';button.disabled=false;button.textContent='دخول لوحة الإدارة';render();}
 }
 async function hydrateFromSupabase() {
+  const status=document.getElementById('connection-status');
   try {
     const [schools,subjects,stages,grades,teachers,contacts,teacherSubjects,teacherGrades,teacherSchools,services,listings,memorials,homepageSlides]=await Promise.all([
       supabaseRows('schools','select=id,name,address,phone,whatsapp,location_url,description,image_url&is_active=eq.true&order=name'),
@@ -131,9 +132,9 @@ async function hydrateFromSupabase() {
     db.teacherRequests=[];db.memorialRequests=[];
     subjectCatalog.splice(0,subjectCatalog.length,...subjects.map(s=>s.name));
     stagesCatalog.splice(0,stagesCatalog.length,...stages.map(s=>({name:s.name,grades:grades.filter(g=>g.stage_id===s.id).map(g=>g.name)})));
-    backendConnected=true;render();
+    backendConnected=true;status.innerHTML='<span class="demo-dot"></span> متصل بقاعدة البيانات — طلبات التقديم تُرسل للمراجعة';render();
   } catch(error) {
-    backendConnected=false;db=emptyData();slides=[];render();console.warn('Supabase connection:',error);
+    backendConnected=false;db=emptyData();slides=[];status.innerHTML='<span class="demo-dot"></span> تعذّر الاتصال بقاعدة البيانات — لن تظهر بيانات حتى يعود الاتصال';render();console.warn('Supabase connection:',error);
   }
 }
 function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
@@ -185,7 +186,7 @@ function teacherCard(t) {
   </article>`;
 }
 function listingCard(listing) {
-  const teacher=teacherById(listing.teacherId); const subjectText=(listing.subjects||[]).join('، ')||listing.subject||'';const cover=listing.type==='course'?'course-cover':(subjectText.includes('عربي')?'':'teal-cover');
+  const teacher=teacherById(listing.teacherId); const subjectText=(listing.subjects||[]).join('، ')||listing.subject||'';const cover=listing.type==='course'?'gold-cover':(subjectText.includes('عربي')?'':'teal-cover');
   let startDate='';
   if(listing.startDate){
     const [year,month,day]=listing.startDate.split('-').map(Number);const target=new Date(year,month-1,day);const today=new Date();today.setHours(0,0,0,0);const days=Math.round((target-today)/86400000);

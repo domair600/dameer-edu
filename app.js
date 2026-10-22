@@ -1,8 +1,9 @@
-/* Arabic-first UI for منصة الضمير التعليمية. Public content and application
-   submission use Supabase; account management and admin review remain staged. */
+/* Arabic-first UI for منصة الضمير التعليمية. Public content, applications,
+   teacher self-service, and admin review use Supabase-backed workflows. */
 const LEGACY_STORAGE_KEY = 'dameer-education-prototype-v1';
 const TRACKING_STORAGE_KEY = 'dameer-application-tracking-v1';
 const APPLY_DRAFT_STORAGE_KEY = 'dameer-application-draft-v1';
+const TEACHER_SESSION_KEY = 'dameer-teacher-session-v1';
 const stagesCatalog = [
   { name: 'المرحلة الابتدائية', grades: ['الأول', 'الثاني', 'الثالث', 'الرابع', 'الخامس', 'السادس'] },
   { name: 'المرحلة الإعدادية', grades: ['السابع', 'الثامن', 'التاسع'] },
@@ -22,12 +23,16 @@ let searchDebounceTimer = null;
 let searchLimit = 20;
 let searchResultFilter = 'all';
 let heroIndex = 0;
+let homeMemorialRotation = 0;
+let homeMemorialOrder = [];
 let adminSection = 'overview';
 let adminQueue = 'teachers';
 let featuredAdminSearch = '';
 let featuredAdminSort = 'name-asc';
-let managingTeacherId = '';
-let managingTeacherCode = '';
+let savedTeacherSession=null;
+try { savedTeacherSession=JSON.parse(localStorage.getItem(TEACHER_SESSION_KEY)||'null'); } catch {}
+let managingTeacherId = savedTeacherSession?.teacherId?String(savedTeacherSession.teacherId):'';
+let managingTeacherCode = /^\d{8}$/.test(savedTeacherSession?.controlCode||'')?savedTeacherSession.controlCode:'';
 let manageError = '';
 let teacherFormMode = 'teacher';
 let selectedPhoto = '';
@@ -38,6 +43,7 @@ let photoCrop = null;
 let backendConnected = false;
 let backendLoading = true;
 let backendBaseLoaded = false;
+let backendDetailsLoaded = false;
 let backendLoadError = '';
 const ADMIN_SESSION_KEY = 'dameer-admin-session-v1';
 let adminSession = (() => { try { return JSON.parse(localStorage.getItem(ADMIN_SESSION_KEY) || 'null'); } catch { return null; } })();
@@ -286,7 +292,7 @@ async function loginAdmin(form) {
   } catch(error){adminLoginError=error.message||'تعذر تسجيل الدخول.';button.disabled=false;button.textContent='دخول لوحة الإدارة';render();}
 }
 async function hydrateFromSupabase() {
-  backendLoading=true;backendLoadError='';render();
+  backendLoading=true;backendDetailsLoaded=false;backendLoadError='';render();
   let schools,teachers,listings,memorials,homepageSlides;
   try {
     [schools,teachers,listings,memorials,homepageSlides]=await Promise.all([
@@ -323,9 +329,9 @@ async function hydrateFromSupabase() {
     db.teachers=db.teachers.map(t=>{const id=Number(t.id),teacherStageRows=related(teacherStages,id),teacherGradeRows=related(teacherGrades,id);return {...t,schoolId:String(related(teacherSchools,id)[0]?.school_id||''),subjects:related(teacherSubjects,id).map(x=>x.subjects?.name).filter(Boolean),stages:[...new Set([...teacherStageRows.map(x=>x.education_stages?.name),...teacherGradeRows.map(x=>x.education_stages?.name)].filter(Boolean))],grades:teacherGradeRows.map(x=>x.grades?.name).filter(Boolean),services:related(services,id).map(x=>x.title),contacts:related(contacts,id).map(x=>({type:x.contact_type,value:x.phone_number}))};});
     subjectCatalog.splice(0,subjectCatalog.length,...subjects.map(s=>s.name));
     stagesCatalog.splice(0,stagesCatalog.length,...stages.map(s=>({name:s.name,grades:grades.filter(g=>g.stage_id===s.id).map(g=>g.name)})));
-    backendLoadError='';render();
+    backendDetailsLoaded=true;backendLoadError='';render();
   } catch(error) {
-    backendLoadError='تعذر تحميل بعض تفاصيل المعلمين. أعد المحاولة لتحديث البيانات.';render();console.warn('Supabase details:',error);
+    backendDetailsLoaded=true;backendLoadError='تعذر تحميل بعض تفاصيل المعلمين. أعد المحاولة لتحديث البيانات.';render();console.warn('Supabase details:',error);
   }
 }
 function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
@@ -337,9 +343,9 @@ function setView(next, updateHistory=true) {
   clearTimeout(searchDebounceTimer);searchDebounceTimer=null;
   const page=document.body.dataset.page||'public';
   if(dedicatedPageFiles[next]&&page!==next){location.href=`${dedicatedPageFiles[next]}#${next}`;return;}
-  if(page==='public'&&window.DAMEER_SUPABASE?.prelaunchMode&&['home','teachers','lessons','schools','memorials','search'].includes(next)){view='prelaunch';render();if(updateHistory&&location.hash!=='#home')history.pushState({},'','#home');return;}
+  if(page==='public'&&window.DAMEER_SUPABASE?.prelaunchMode&&['home','teachers','lessons','exams','schools','memorials','search'].includes(next)){view='prelaunch';render();if(updateHistory&&location.hash!=='#home')history.pushState({},'','#home');return;}
   if(next==='home'&&view!=='home'){homeSearchDraft={query:'',mode:'all',subject:''};searchState={query:'',mode:'all',subject:'',grade:'',listingType:''};searchResultFilter='all';searchLimit=20;}
-  if(page!=='public'&&!dedicatedPageFiles[next]&&['home','teachers','lessons','schools','memorials','search'].includes(next)){location.href=`index.html#${next}`;return;}
+  if(page!=='public'&&!dedicatedPageFiles[next]&&['home','teachers','lessons','exams','schools','memorials','search'].includes(next)){location.href=`index.html#${next}`;return;}
   view=next;
   if(next==='admin'&&adminAccessToken)adminQueueLoaded=false;
   if(updateHistory&&location.hash!==`#${next}`)history.pushState({},'',`#${next}`);
@@ -348,7 +354,7 @@ function setView(next, updateHistory=true) {
 }
 window.addEventListener('popstate',()=>{
   const next=location.hash.slice(1)||'home';
-  if(['home','teachers','lessons','schools','memorials','apply','manage','admin','search'].includes(next))setView(next,false);
+  if(['home','teachers','lessons','exams','schools','memorials','apply','manage','admin','search'].includes(next))setView(next,false);
 });
 function toast(message, error=false) { toastRoot.innerHTML=`<div class="toast ${error?'error':''}">${escapeHtml(message)}</div>`; const el=toastRoot.firstElementChild; requestAnimationFrame(()=>el.classList.add('show')); setTimeout(()=>el.classList.remove('show'),3000); }
 function routeLink(label, next, extra='') { return `<button class="text-link ${extra}" data-view="${next}">${label} <span aria-hidden="true">←</span></button>`; }
@@ -367,7 +373,30 @@ function homeSelection(items,limit) {
   const score=item=>{let h=2166136261;for(const ch of `${day}:${item.id}`){h^=ch.charCodeAt(0);h=Math.imul(h,16777619);}return h>>>0;};
   return [...featured,...rest.sort((a,b)=>score(a)-score(b))].slice(0,limit);
 }
+function homeMemorialSelection() {
+  const items=db.memorials.filter(item=>item.approved);
+  const featured=items.find(item=>item.featured);
+  const rotatingItems=items.filter(item=>!featured||String(item.id)!==String(featured.id));
+  const ids=new Set(rotatingItems.map(item=>String(item.id)));
+  homeMemorialOrder=homeMemorialOrder.filter(id=>ids.has(id));
+  const unseen=rotatingItems.filter(item=>!homeMemorialOrder.includes(String(item.id)));
+  const shuffle=rows=>{const result=[...rows];for(let i=result.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[result[i],result[j]]=[result[j],result[i]];}return result;};
+  // Keep the featured memorial pinned first; randomize the remaining cards per visit.
+  homeMemorialOrder.push(...shuffle(unseen).map(item=>String(item.id)));
+  const byId=new Map(rotatingItems.map(item=>[String(item.id),item]));
+  if(homeMemorialOrder.length!==rotatingItems.length){
+    homeMemorialOrder=shuffle(rotatingItems).map(item=>String(item.id));
+    homeMemorialRotation=0;
+  }
+  if(!items.length)return [];
+  const pinned=featured?[featured]:[];
+  if(!homeMemorialOrder.length)return pinned.slice(0,3);
+  const offset=homeMemorialRotation%homeMemorialOrder.length;
+  const rotated=[...homeMemorialOrder.slice(offset),...homeMemorialOrder.slice(0,offset)];
+  return [...pinned,...rotated.slice(0,3-pinned.length).map(id=>byId.get(id)).filter(Boolean)].slice(0,3);
+}
 function teacherCard(t) {
+  const bio=t.bio||'لا توجد نبذة مضافة حتى الآن.';
   const subject=(t.subjects||[]).join('، ')||'معلم';
   const school=schoolById(t.schoolId);
   const stageTags=(t.stages||[]).map(stage=>`<span class="education-chip">${escapeHtml(stage.replace(/^المرحلة\s*/,''))}</span>`).join('')||'<span class="education-empty">غير محددة</span>';
@@ -376,7 +405,7 @@ function teacherCard(t) {
     ${t.demo?'<span class="badge-sample">مثال تجريبي</span>':''}
     <div class="teacher-top">${avatarMarkup(t)}<div><h3 class="teacher-name">${escapeHtml(t.name)}</h3><div class="teacher-subject">${escapeHtml(subject)}</div><div class="teacher-meta">${(t.status==='retired'?'<span class="tag retired">متقاعد</span>':'')}<span class="tag gender">${t.gender==='female'?'معلمة':'معلم'}</span>${school?`<span class="tag">${escapeHtml(school.name)}</span>`:''}<span class="tag teacher-experience">${t.years?`${t.years} سنة خبرة`:'خبرة تعليمية'}</span></div></div></div>
     <div class="teacher-education"><div class="teacher-education-row"><span class="teacher-education-label"><svg class="education-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18M5 19V9l7-4 7 4v10M9 19v-6h6v6M8 10h.01M16 10h.01"/></svg>المراحل</span><div class="teacher-education-values">${stageTags}</div></div><div class="teacher-education-row"><span class="teacher-education-label"><svg class="education-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5c3.3-.9 6.3-.4 9 1.5v13c-2.7-1.9-5.7-2.4-9-1.5zM21 5.5c-3.3-.9-6.3-.4-9 1.5v13c2.7-1.9 5.7-2.4 9-1.5zM6 9h3M6 12h3M15 9h3M15 12h3"/></svg>الصفوف</span><div class="teacher-education-values">${gradeTags}</div></div></div>
-    <p class="teacher-bio">${escapeHtml(t.bio||'لا توجد نبذة مضافة حتى الآن.')}</p>
+    <p class="teacher-bio" data-bio-text>${escapeHtml(bio)}</p>${bio.length>115?'<button class="bio-toggle" type="button" aria-expanded="false">اقرأ المزيد <span aria-hidden="true">⌄</span></button>':''}
     <div class="card-bottom"><div class="teacher-actions"><button class="icon-btn" title="مشاركة البطاقة" data-share-teacher="${escapeHtml(t.id)}">↗</button>${t.contacts?.[0]?.value?`<a class="icon-btn" title="اتصال" href="tel:${escapeHtml(t.contacts[0].value)}" onclick="event.stopPropagation()">☎</a>`:''}<button class="btn btn-outline btn-small" data-open-teacher="${escapeHtml(t.id)}">عرض البطاقة</button></div></div>
   </article>`;
 }
@@ -398,7 +427,12 @@ function schoolCard(s) {
   const map=s.location?`<a class="btn btn-quiet btn-small" href="${escapeHtml(s.location)}" target="_blank" rel="noopener">الموقع</a>`:'';
   return `<article class="school-card">${s.image?`<img class="school-photo" src="${escapeHtml(s.image)}" alt="صورة ${escapeHtml(s.name)}">`:'<div class="school-mark">▣</div>'}<h3>${escapeHtml(s.name)}</h3><div class="school-type">${escapeHtml(s.type||'مدرسة')}</div><p class="school-address">${escapeHtml(s.address||'العنوان غير مضاف')}</p><div class="school-footer"><span>الكادر التعليمي: <b>${staff}</b></span><div class="teacher-actions">${phone}${map}<button class="icon-btn" title="عرض الكادر" data-school-staff="${escapeHtml(s.id)}">⌕</button></div></div></article>`;
 }
-function memorialCard(m) { return `<article ${featuredAttrs(m,'memorial-card')}>${featuredBadge(m)}<div class="memorial-photo">${m.photo?`<img src="${m.photo}" alt="صورة ${escapeHtml(m.name)}">`:`<span class="memorial-monogram">${escapeHtml(initials(m.name))}</span>`}<span class="mourning-ribbon">رحمه الله</span></div><div class="memorial-copy"><h3>${escapeHtml(m.name)}</h3><p>${escapeHtml(m.bio)}</p></div></article>`; }
+function schoolStaffCard(t) {
+  const subject=(t.subjects||[]).join('، ')||'معلم';
+  const school=schoolById(t.schoolId);
+  return `<article ${featuredAttrs(t,'school-staff-card')}>${featuredBadge(t)}${avatarMarkup(t)}<div class="school-staff-copy"><strong>${escapeHtml(t.name)}</strong><span>${escapeHtml(subject)}</span><small>${t.gender==='female'?'معلمة':'معلم'}${t.status==='retired'?' · متقاعد':''}${school?` · ${escapeHtml(school.name)}`:''}</small></div><button class="btn btn-outline btn-small" type="button" data-open-teacher="${escapeHtml(t.id)}">عرض البطاقة</button></article>`;
+}
+function memorialCard(m) { const bio=m.bio||'';return `<article ${featuredAttrs(m,'memorial-card')}>${featuredBadge(m)}<div class="memorial-photo">${m.photo?`<img src="${m.photo}" alt="صورة ${escapeHtml(m.name)}" loading="lazy">`:`<span class="memorial-monogram">${escapeHtml(initials(m.name))}</span>`}<span class="mourning-ribbon">رحمه الله</span></div><div class="memorial-copy"><h3>${escapeHtml(m.name)}</h3><p data-bio-text>${escapeHtml(bio)}</p>${bio.length>115?'<button class="bio-toggle" type="button" aria-expanded="false">اقرأ المزيد <span aria-hidden="true">⌄</span></button>':''}</div></article>`; }
 function emptyState(title, desc, icon='⌕') { return `<div class="empty-state"><div class="empty-icon">${icon}</div><h3>${title}</h3><p>${desc}</p></div>`; }
 
 let slides=[];
@@ -410,6 +444,13 @@ function renderHero() {
     <form class="search-panel" id="home-search"><label class="search-field"><span class="field-icon">⌕</span><input name="query" placeholder="اسم معلم، مادة، أو درس..." value="${escapeHtml(homeSearchDraft.query)}"></label><label class="search-field"><span class="field-icon">▤</span><select name="mode"><option value="all" ${homeSearchDraft.mode==='all'?'selected':''}>بحث شامل</option><option value="name" ${homeSearchDraft.mode==='name'?'selected':''}>حسب الاسم</option><option value="subject" ${homeSearchDraft.mode==='subject'?'selected':''}>حسب المادة</option><option value="grade" ${homeSearchDraft.mode==='grade'?'selected':''}>حسب الصف</option></select></label><label class="search-field"><span class="field-icon">⌄</span><select name="subject"><option value="" ${homeSearchDraft.subject===''?'selected':''}>كل المواد</option>${subjectCatalog.map(s=>`<option value="${escapeHtml(s)}" ${homeSearchDraft.subject===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></label><button class="btn btn-primary" type="submit">ابحث الآن <span>←</span></button></form>
     <div class="stats-row"><div class="stat-card"><span class="stat-icon">♙</span><div><strong>${backendBaseLoaded?db.teachers.filter(t=>t.approved&&t.gender==='male').length:'—'}</strong><span>معلمون</span></div></div><div class="stat-card"><span class="stat-icon teal">♙</span><div><strong>${backendBaseLoaded?db.teachers.filter(t=>t.approved&&t.gender==='female').length:'—'}</strong><span>معلمات</span></div></div><div class="stat-card"><span class="stat-icon gold">✦</span><div><strong>${backendBaseLoaded?db.listings.filter(x=>x.status==='published').length:'—'}</strong><span>دورات ودروس</span></div></div><div class="stat-card"><span class="stat-icon">▣</span><div><strong>${backendBaseLoaded?db.schools.length:'—'}</strong><span>مدارس</span></div></div></div></div></section>`;
 }
+function refreshHeroInPlace() {
+  const current=document.querySelector('.hero-wrap .hero');
+  if(!current)return;
+  const wrapper=document.createElement('div');wrapper.innerHTML=renderHero();
+  const next=wrapper.querySelector('.hero');
+  if(next)current.replaceWith(next);
+}
 function renderHomeLoadNotice() {
   if(backendLoading)return `<div class="container"><div class="home-load-state" role="status" aria-live="polite"><span class="home-load-spinner" aria-hidden="true"></span><span><strong>نجهّز منصة الضمير التعليمية</strong><small>جارٍ تحميل المعلمين والدورات والمدارس…</small></span></div></div>`;
   if(backendLoadError)return `<div class="container"><div class="home-load-state home-load-error" role="status"><span aria-hidden="true">!</span><span><strong>${escapeHtml(backendLoadError)}</strong><small>تحقق من اتصال الإنترنت ثم حاول مرة أخرى.</small></span><button type="button" class="btn btn-outline btn-small" data-retry-content>إعادة المحاولة</button></div></div>`;
@@ -418,12 +459,17 @@ function renderHomeLoadNotice() {
 function renderHome() {
   const notice=renderHomeLoadNotice();
   if(homeSearchDraft.query.trim())return `${renderHero()}${notice}${backendBaseLoaded?renderSearch(true):''}`;
-  if(!backendBaseLoaded)return `${renderHero()}<section class="section"><div class="container">${notice}${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}<div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>`;
+  if(!backendBaseLoaded)return `${renderHero()}<section class="section"><div class="container">${notice}${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}<div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="exams"><span class="quick-icon">▤</span><div><h3>الامتحانات والموارد</h3><p>أسئلة سابقة وحلول ونصائح دراسية</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>`;
+  const teachers=homeSelection(db.teachers.filter(t=>t.approved),3);
+  const listings=homeSelection(db.listings.filter(x=>x.status==='published'),3);
+  const memorials=homeMemorialSelection();
+  const teacherSection=teachers.length?`<section class="section section-white"><div class="container">${sectionHead('أهل الخبرة','معلمون ومعلمات من الضمير','تعرّف إلى الكادر التعليمي القريب منك.',routeLink('عرض الدليل كاملاً','teachers'))}<div class="teacher-grid">${teachers.map(teacherCard).join('')}</div></div></section>`:'';
+  const listingSection=listings.length?`<section class="section"><div class="container">${sectionHead('فرص قريبة','دورات ودروس معلنة','إعلانات تعليمية أضافها المعلمون مباشرة.',routeLink('كل الإعلانات','lessons'))}<div class="listing-grid">${listings.map(listingCard).join('')}</div></div></section>`:'';
+  const memorialCallout=`<div class="impact-strip"><div><strong>هل ترغب بتقديم ذكرى معلم أو معلمة راحلين؟</strong><span>أرسل صورة ونبذة قصيرة لتصل إلى الإدارة للمراجعة.</span></div><button class="btn btn-outline" data-view="apply" data-form-kind="memorial">إرسال بطاقة تذكارية <span>←</span></button><span class="impact-mark">✦</span></div>`;
+  const memorialSection=memorials.length?`<section class="section section-white"><div class="container">${sectionHead('ذاكرة ووفاء','معلمون تركوا أثرًا','نحفظ ذكرى من زرعوا فينا المعرفة والود.',routeLink('اقرأ سيرهم','memorials'))}<div class="memorial-grid" id="home-memorial-grid">${memorials.map(memorialCard).join('')}</div>${memorialCallout}</div></section>`:`<section class="section section-white"><div class="container">${memorialCallout}</div></section>`;
   return `${renderHero()}${notice}<section class="section"><div class="container">${sectionHead('ابدأ من هنا','كل ما تحتاجه في مكان واحد','اختر القسم الذي تبحث عنه، واستكشف مجتمع التعليم في الضمير.')}
-    <div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>
-    <section class="section section-white"><div class="container">${sectionHead('أهل الخبرة','معلمون ومعلمات من الضمير','تعرّف إلى الكادر التعليمي القريب منك.',routeLink('عرض الدليل كاملاً','teachers'))}<div class="teacher-grid">${homeSelection(db.teachers.filter(t=>t.approved),3).map(teacherCard).join('')}</div></div></section>
-    <section class="section"><div class="container">${sectionHead('فرص قريبة','دورات ودروس معلنة','إعلانات تعليمية أضافها المعلمون مباشرة.',routeLink('كل الإعلانات','lessons'))}<div class="listing-grid">${homeSelection(db.listings.filter(x=>x.status==='published'),3).map(listingCard).join('')}</div></div></section>
-    <section class="section section-white"><div class="container">${sectionHead('ذاكرة ووفاء','معلمون تركوا أثرًا','نحفظ ذكرى من زرعوا فينا المعرفة والود.',routeLink('اقرأ سيرهم','memorials'))}<div class="memorial-grid">${homeSelection(db.memorials.filter(m=>m.approved),2).map(memorialCard).join('')}</div><div class="impact-strip"><div><strong>هل ترغب بتقديم ذكرى معلم أو معلمة راحلين؟</strong><span>أرسل صورة ونبذة قصيرة لتصل إلى الإدارة للمراجعة.</span></div><button class="btn btn-outline" data-view="apply" data-form-kind="memorial">إرسال بطاقة تذكارية <span>←</span></button><span class="impact-mark">✦</span></div></div></section>`;
+    <div class="quick-grid"><article class="quick-card" data-view="teachers"><span class="quick-icon">♙</span><div><h3>المعلمون والمعلمات</h3><p>ابحث بحسب المادة والصف والخبرة</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="lessons"><span class="quick-icon">✎</span><div><h3>الدورات والدروس الخصوصية</h3><p>فرص تعليمية يعلن عنها المعلمون</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="exams"><span class="quick-icon">▤</span><div><h3>الامتحانات والموارد</h3><p>أسئلة سابقة وحلول ونصائح دراسية</p></div><span class="quick-arrow">←</span></article><article class="quick-card" data-view="schools"><span class="quick-icon">▣</span><div><h3>مدارس المدينة</h3><p>مواقع المدارس ووسائل التواصل والكادر</p></div><span class="quick-arrow">←</span></article></div></div></section>
+    ${teacherSection}${listingSection}${memorialSection}`;
 }
 function normalizeSearchText(value='') {
   return String(value).normalize('NFD').replace(/[\u064B-\u065F\u0670\u0640]/g,'').toLocaleLowerCase('ar')
@@ -448,6 +494,14 @@ function renderLessons() {
   const items=db.listings.filter(l=>l.status==='published'&&(!searchState.listingType||l.type===searchState.listingType)&&searchMatches([l.title,l.description,l.subjects||[],l.subject,l.grades,l.location,teacherById(l.teacherId)?.name||''],searchState.query));
   return `${pageHero('الدورات والدروس الخصوصية','إعلانات تعليمية يضيفها المعلمون بعد اعتماد بطاقاتهم، ويمكنهم تحديثها بأنفسهم.','✎')}<section class="section"><div class="container"><div class="toolbar"><label class="search-field"><span class="field-icon">⌕</span><input id="listing-query" placeholder="ابحث عن دورة أو مادة" value="${escapeHtml(searchState.query)}"></label><select class="search-field" id="listing-type"><option value="" ${!searchState.listingType?'selected':''}>كل الإعلانات</option><option value="private_lesson" ${searchState.listingType==='private_lesson'?'selected':''}>دروس خصوصية</option><option value="course" ${searchState.listingType==='course'?'selected':''}>دورات</option></select><span class="tag">${items.length} إعلان</span></div>${items.length?`<div class="listing-grid" id="listing-grid">${items.slice(0,searchLimit).map(listingCard).join('')}</div>${items.length>searchLimit?`<div class="pagination-row"><button class="btn btn-outline" data-load-more>عرض 20 إعلانًا إضافيًا</button></div>`:''}`:emptyState('لا توجد إعلانات بعد','ستظهر هنا إعلانات المعلمين عن الدورات والدروس الخصوصية.','✎')}</div></section>`;
 }
+function renderExams() {
+  const resources=[
+    {icon:'▤',title:'أسئلة السنوات السابقة',text:'نماذج وأسئلة امتحانية سابقة مرتبة بحسب الصف والمادة لمساعدة الطلاب على التدريب والاستعداد.'},
+    {icon:'📘',title:'حلول الكتب',text:'حلول وتمارين مساندة للكتب المدرسية، مع تنظيم المحتوى بحسب المرحلة والصف والمادة.'},
+    {icon:'✦',title:'نصائح من المدرسين',text:'إرشادات عملية من معلمي المدينة حول المذاكرة، وتنظيم الوقت، والاستعداد للامتحانات.'}
+  ];
+  return `${pageHero('الامتحانات والموارد التعليمية','مساحة تجمع أسئلة السنوات السابقة، وحلول الكتب، ونصائح المدرسين لمساندة الطلاب في دراستهم.','▤')}<section class="section"><div class="container"><div class="exam-resource-grid">${resources.map(item=>`<article class="exam-resource-card"><span class="exam-resource-icon" aria-hidden="true">${item.icon}</span><h2>${item.title}</h2><p>${item.text}</p><span class="exam-resource-note">سيُضاف المحتوى تباعًا</span></article>`).join('')}</div><div class="exam-contribute"><div><strong>هل أنت مدرس وتود مشاركة مادة تعليمية؟</strong><span>سيُتاح استقبال الأسئلة والحلول والنصائح التعليمية ضمن هذا القسم.</span></div><span class="exam-contribute-mark" aria-hidden="true">✎</span></div></div></section>`;
+}
 function renderSchools() { return `${pageHero('مدارس مدينة الضمير','تعرّف إلى المدارس ومواقعها ووسائل التواصل، واكتشف المعلمين ضمن كادرها.','▣')}<section class="section"><div class="container">${db.schools.length?`<div class="school-grid">${db.schools.map(schoolCard).join('')}</div>`:emptyState('لا توجد مدارس مضافة','ستظهر المدارس بعد أن تضيفها الإدارة.','▣')}</div></section>`; }
 function renderMemorials() { return `${pageHero('معلمون تركوا أثرًا','صفحات وفاء تخلّد ذكرى المعلمين والمعلمات الراحلين وتحتفظ بسيرتهم.','✦')}<section class="section"><div class="container">${db.memorials.filter(m=>m.approved).length?`<div class="memorial-grid">${db.memorials.filter(m=>m.approved).map(memorialCard).join('')}</div>`:emptyState('لا توجد بطاقات تذكارية بعد','يمكن إرسال طلب إضافة بطاقة للمراجعة من نموذج التقديم.','✦')}<div class="impact-strip"><div><strong>احفظوا ذكرى من علّمكم</strong><span>الصورة والنبذة تُعرضان بعد موافقة الإدارة.</span></div><button class="btn btn-outline" data-view="apply" data-form-kind="memorial">إرسال بطاقة تذكارية <span>←</span></button></div></div></section>`; }
 function teacherForm() {
@@ -461,13 +515,22 @@ function memorialForm() { return `<h2 class="form-section-title">بطاقة وف
 function renderApply() {
   return `${pageHero('انضمام لمنصة الضمير التعليمية','قدّم بياناتك الآن ليتم تدقيقها وتجهيز بطاقتك.','＋')}<section class="section"><div class="container form-layout"><form class="form-card" id="apply-form"><div class="form-choice"><button type="button" class="choice-card ${teacherFormMode==='teacher'?'selected':''}" data-form-mode="teacher"><span class="choice-emoji">♙</span><span><strong>معلم أو معلمة</strong><small>بطاقة تعليمية قابلة للإدارة</small></span></button><button type="button" class="choice-card ${teacherFormMode==='memorial'?'selected':''}" data-form-mode="memorial"><span class="choice-emoji">✦</span><span><strong>معلم راحل</strong><small>بطاقة تذكارية للمراجعة</small></span></button></div>${teacherFormMode==='teacher'?'<div class="apply-identity-warning" role="note"><p>سيُحفظ رمز إدارة بطاقتك وإعلاناتك على هذا المتصفح لتعود إليه لاحقًا.</p></div>':''}${teacherFormMode==='teacher'?teacherForm():memorialForm()}<div id="form-result"></div></form><aside class="side-card"><h3>طلب الانضمام</h3><p>املأ البيانات المطلوبة لإرسال طلبك إلى إدارة منصة الضمير التعليمية.</p><ul class="side-list">${teacherFormMode==='teacher'?'<li>بعد الإرسال يظهر رمز تحكم من 8 أرقام ورمز تتبع منفصل.</li><li>تابع حالة الطلب من جدول التتبع أسفل هذه الصفحة.</li><li>بعد اعتماد البطاقة، تستطيع تعديل البيانات المتغيرة وإضافة إعلاناتك.</li>':'<li>البطاقة التذكارية لا تحتاج إلى رمز تحكم.</li><li>يُراجع الاسم والصورة والنبذة قبل النشر.</li><li>سيظهر رمز تتبع مستقل بعد الإرسال لمتابعة النتيجة.</li>'}</ul><a class="btn btn-outline btn-small" href="#tracking">الانتقال إلى تتبع الطلبات ↓</a><div class="warning-note">${backendConnected?'يُرسل الطلب إلى قاعدة البيانات للمراجعة.':'تعذر الاتصال الآن؛ لن يُرسل الطلب حتى يعود الاتصال بقاعدة البيانات.'}</div></aside></div><div class="container tracking-section" id="tracking"><div class="tracking-heading"><div><h2>تتبع طلباتي</h2><p>تُحفظ المسودة ورموز التحكم والتتبع على هذا المتصفح. بعد قبول الطلب يُخفى رمز التتبع.</p></div><button class="btn btn-outline btn-small" type="button" data-refresh-all-tracking>تحديث الحالات</button></div><form class="tracking-lookup" id="tracking-lookup-form"><label for="tracking-code-input">لديك رمز تتبع؟</label><div><input id="tracking-code-input" name="trackingCode" inputmode="text" autocomplete="off" maxlength="16" minlength="16" pattern="[A-Fa-f0-9]{16}" placeholder="مثال: 5A0B91D4C77E20F3" required><button class="btn btn-primary btn-small" type="submit">إضافة طلب للمتابعة</button></div><small>أدخل رمز التتبع الذي ظهر عند الإرسال إذا كنت تستخدم متصفحًا آخر أو حذفت بيانات المتصفح.</small></form>${renderSavedTeacherCodes()}<div id="tracking-table-container"></div></div></section>`;
 }
+function teacherContactDigits(contact) {
+  const digits=localPhoneDigits(contact?.value||'');
+  const prefix=contact?.type==='landline'?'96311':'963';
+  return digits.startsWith(prefix)?digits.slice(prefix.length):digits;
+}
 function renderManage() {
   const teacher=teacherById(managingTeacherId);
-  if(!teacher) return `${pageHero('إدارة بطاقتي','أدخل الاسم ورمز التحكم الذي ظهر لك عند تقديم الطلب.','⌘')}<section class="section"><div class="container"><form id="manage-login" class="form-card login-card"><h2 class="form-section-title">الدخول إلى إدارة البطاقة</h2><p style="font-size:12px;color:#7b8c9e;line-height:1.8;margin-top:0">استخدم الاسم كما أرسلته ورمز التحكم المكوّن من 8 أرقام.</p>${manageError?`<div class="notice-error">${escapeHtml(manageError)}</div>`:''}<div class="form-grid"><div class="field full"><label>الاسم الكامل</label><input name="name" required></div><div class="field full"><label>رمز التحكم</label><input name="code" required inputmode="numeric" maxlength="8" placeholder="••••••••"></div></div><div class="form-footer"><span class="consent">هل فقدت الرمز؟ اطلب من الإدارة إصدار رمز جديد بعد التحقق من هويتك.</span><button class="btn btn-primary" type="submit">متابعة <span>←</span></button></div></form></div></section>`;
-  const ads=db.listings.filter(l=>l.teacherId===teacher.id);
-  return `${pageHero('إدارة بطاقتي','عدّل معلوماتك المتغيرة وأدر إعلانات الدروس والدورات.','⌘')}<section class="section"><div class="container"><div class="manage-hero"><h2>مرحبًا ${escapeHtml(teacher.name)}</h2><p>الاسم مثبت في البطاقة. لتغييره، أرسل طلبًا للإدارة.</p></div><div class="form-card" style="margin-bottom:15px"><h2 class="form-section-title">بيانات البطاقة</h2><form id="profile-edit" data-id="${teacher.id}"><div class="form-grid"><div class="field"><label>الاسم</label><input value="${escapeHtml(teacher.name)}" disabled></div><div class="field"><label>الحالة الوظيفية</label><select name="status"><option value="active" ${teacher.status==='active'?'selected':''}>على رأس العمل</option><option value="retired" ${teacher.status==='retired'?'selected':''}>متقاعد / متقاعدة</option></select></div><div class="field"><label>سنوات الخبرة</label><input name="years" type="number" min="0" value="${teacher.years||''}"></div><div class="field"><label>المدرسة</label><select name="schoolId"><option value="">لا أختار مدرسة</option>${db.schools.map(s=>`<option value="${s.id}" ${teacher.schoolId===s.id?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}</select></div><div class="field full"><label>نبذة قصيرة</label><textarea name="bio">${escapeHtml(teacher.bio||'')}</textarea></div><div class="field full"><label>العنوان</label><input name="address" value="${escapeHtml(teacher.address||'')}"></div><div class="field full"><label>الخدمات التعليمية</label><input name="services" value="${escapeHtml((teacher.services||[]).join('، '))}"></div><div class="field"><label>رقم جوال / أرضي</label><input name="phone1" value="${escapeHtml(teacher.contacts?.[0]?.value||'')}"></div><div class="field"><label>نوع الرقم الأول</label><select name="phoneType1"><option value="mobile">جوال</option><option value="whatsapp">واتساب</option><option value="landline">هاتف أرضي</option></select></div><div class="field"><label>رقم ثانٍ</label><input name="phone2" value="${escapeHtml(teacher.contacts?.[1]?.value||'')}"></div><div class="field"><label>نوع الرقم الثاني</label><select name="phoneType2"><option value="whatsapp">واتساب</option><option value="mobile">جوال</option><option value="landline">هاتف أرضي</option></select></div></div><div class="form-footer"><span class="consent">التعديلات تظهر مباشرة في النسخة التجريبية.</span><button class="btn btn-primary" type="submit">حفظ التعديلات</button></div></form></div><div class="form-card"><div class="dash-heading"><div><h2>إعلاناتي</h2><p>أضف دورة أو درسًا خصوصيًا. إعادة الإظهار متاحة كل 3 أيام.</p></div><button class="btn btn-primary btn-small" data-add-listing>＋ إعلان جديد</button></div><div id="teacher-listings">${ads.length?ads.map(ad=>`<div class="listing-manage-row"><div><strong>${escapeHtml(ad.title)}</strong><small>${ad.type==='course'?'دورة':'درس خصوصي'} · آخر إظهار ${fmtDate(ad.bumpAt)}</small></div><div class="small-actions"><button class="btn btn-quiet btn-small" data-edit-listing="${ad.id}">تعديل</button><button class="btn btn-outline btn-small" data-bump-listing="${ad.id}" ${Date.now()-ad.bumpAt<72*3600000?'disabled':''}>إعادة النشر</button><button class="btn btn-danger btn-small" data-delete-listing="${ad.id}">حذف</button></div></div>`).join(''):emptyState('لا توجد إعلانات','أضف أول دورة أو درس خصوصي.','✎')}</div></div><div style="text-align:left;margin-top:12px"><button class="text-link" data-logout-manage>تسجيل الخروج من إدارة البطاقة</button></div></div></section>`;
-}
-function adminStats() { return `<div class="dashboard-cards"><div class="dash-stat"><span>طلبات المعلمين المعلّقة</span><strong>${db.teacherRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>بطاقات تذكارية للمراجعة</span><strong>${db.memorialRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>البطاقات المنشورة</span><strong>${db.teachers.filter(t=>t.approved).length+db.memorials.filter(m=>m.approved).length}</strong></div></div>`; }
+  if(!teacher&&backendLoading)return `${pageHero('إدارة بياناتي وإعلاناتي','جارٍ تحميل بيانات المنصة للتحقق من البطاقة.','⌘')}<section class="section"><div class="container"><div class="form-card login-card" role="status">جارٍ الاتصال بالمنصة…</div></div></section>`;
+  if(!teacher&&!backendConnected)return `${pageHero('إدارة بياناتي وإعلاناتي','تعذّر الاتصال بقاعدة بيانات المنصة.','⌘')}<section class="section"><div class="container"><div class="form-card login-card"><div class="notice-error">لم يتم تسجيل الدخول أو حفظ أي تعديل. تحقق من الاتصال ثم أعد المحاولة.</div><button class="btn btn-primary" type="button" data-retry-content>إعادة الاتصال</button></div></div></section>`;
+  if(teacher&&!backendDetailsLoaded)return `${pageHero('إدارة بياناتي وإعلاناتي','جارٍ تحميل بيانات البطاقة والإعلانات.','⌘')}<section class="section"><div class="container"><div class="form-card login-card" role="status">لحظة من فضلك…</div></div></section>`;
+  if(!teacher) return `${pageHero('إدارة بياناتي وإعلاناتي','أدخل الاسم الكامل ورمز التحكم الذي ظهر لك عند تقديم طلب الانضمام.','⌘')}<section class="section"><div class="container"><form id="manage-login" class="form-card login-card"><h2 class="form-section-title">الدخول إلى إدارة البطاقة</h2><p style="font-size:12px;color:#7b8c9e;line-height:1.8;margin-top:0">استخدم الاسم نفسه الذي أرسلته ورمز التحكم المكوّن من 8 أرقام. بعد تسجيل الدخول سيبقى حسابك متاحًا على هذا المتصفح.</p>${manageError?`<div class="notice-error">${escapeHtml(manageError)}</div>`:''}<div class="form-grid"><div class="field full"><label>الاسم الكامل</label><input name="name" autocomplete="name" required></div><div class="field full"><label>رمز التحكم</label><input name="code" required inputmode="numeric" pattern="[0-9]{8}" maxlength="8" autocomplete="current-password" placeholder="••••••••"></div></div><div class="form-footer"><a class="text-link" href="apply.html">العودة إلى صفحة الانضمام</a><button class="btn btn-primary" type="submit">متابعة <span>←</span></button></div></form></div></section>`;
+  const ads=db.listings.filter(l=>String(l.teacherId)===String(teacher.id)&&l.status!=='deleted');
+  const typeOptions=(selected)=>[['mobile','جوال'],['whatsapp','واتساب'],['landline','هاتف أرضي']].map(([value,label])=>`<option value="${value}" ${selected===value?'selected':''}>${label}</option>`).join('');
+  const phoneField=(number,label)=>{const contact=teacher.contacts?.[number-1]||null,type=contact?.type|| (number===1?'mobile':'whatsapp');return `<div class="field"><label for="manage-phone-${number}">${label}</label><div class="syria-phone"><span data-manage-phone-prefix="${number}" dir="ltr">${phonePrefix(type)}</span><input id="manage-phone-${number}" name="phone${number}" type="tel" inputmode="numeric" maxlength="9" value="${escapeHtml(teacherContactDigits(contact))}" data-manage-phone="${number}" placeholder="${type==='landline'?'أدخل 7 إلى 9 أرقام':'أدخل 9 أرقام'}"></div><small class="phone-hint" data-manage-phone-hint="${number}">${type==='landline'?'أدخل من 7 إلى 9 أرقام بعد +963 11.':'أدخل 9 أرقام بعد +963.'}</small></div><div class="field"><label for="manage-phone-type-${number}">نوع الرقم ${number===1?'الأول':'الثاني'}</label><select id="manage-phone-type-${number}" name="phoneType${number}" data-manage-phone-type="${number}">${typeOptions(type)}</select></div>`;};
+  return `${pageHero('إدارة بياناتي وإعلاناتي','حدّث معلومات بطاقتك، وانشر الدورات والدروس الخصوصية مباشرة.','⌘')}<section class="section"><div class="container"><div class="manage-hero"><h2>مرحبًا ${escapeHtml(teacher.name)}</h2><p>اسمك ثابت في البطاقة. لتعديله، تواصل مع إدارة المنصة.</p></div><div class="form-card" style="margin-bottom:15px"><h2 class="form-section-title">بيانات بطاقتي</h2><form id="profile-edit" data-id="${escapeHtml(teacher.id)}"><div class="form-grid"><div class="field"><label>الاسم الكامل</label><input value="${escapeHtml(teacher.name)}" disabled></div><div class="field"><label>الحالة الوظيفية</label><select name="status"><option value="active" ${teacher.status==='active'?'selected':''}>على رأس العمل</option><option value="retired" ${teacher.status==='retired'?'selected':''}>متقاعد / متقاعدة</option></select></div><div class="field"><label>سنوات الخبرة</label><input name="years" type="number" min="0" max="80" step="1" value="${teacher.years??0}"></div><div class="field"><label>المدرسة الحالية</label><select name="schoolId"><option value="">لا أختار مدرسة</option>${db.schools.map(s=>`<option value="${escapeHtml(s.id)}" ${String(teacher.schoolId)===String(s.id)?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}</select></div><div class="field full"><label>نبذة قصيرة</label><textarea name="bio" maxlength="2000">${escapeHtml(teacher.bio||'')}</textarea></div><div class="field full"><label>العنوان أو المنطقة</label><input name="address" maxlength="300" value="${escapeHtml(teacher.address||'')}"></div><div class="field full"><label>الخدمات التعليمية</label><input name="services" maxlength="1000" value="${escapeHtml((teacher.services||[]).join('، '))}" placeholder="دروس تقوية، متابعة واجبات"></div>${phoneField(1,'رقم التواصل الأول')}${phoneField(2,'رقم التواصل الثاني (اختياري)')}</div><div class="form-footer"><span class="consent">تُحفظ التعديلات في المنصة وتظهر على بطاقتك بعد الحفظ.</span><button class="btn btn-primary" type="submit">حفظ التعديلات</button></div></form></div><div class="form-card"><div class="dash-heading"><div><h2>دوراتي ودروسي الخصوصية</h2><p>إعلاناتك تظهر مباشرة بعد النشر. يمكنك تعديلها أو حذفها، وإعادة نشرها كل 3 أيام.</p></div><button class="btn btn-primary btn-small" type="button" data-add-listing>＋ إعلان جديد</button></div><div id="teacher-listings">${ads.length?ads.map(ad=>`<div class="listing-manage-row"><div><strong>${escapeHtml(ad.title)}</strong><small>${ad.type==='course'?'دورة تعليمية':'درس خصوصي'} · آخر نشر ${fmtDate(ad.bumpAt)}</small></div><div class="small-actions"><button class="btn btn-quiet btn-small" type="button" data-edit-listing="${escapeHtml(ad.id)}">تعديل</button><button class="btn btn-outline btn-small" type="button" data-bump-listing="${escapeHtml(ad.id)}" ${Date.now()-ad.bumpAt<72*3600000?'disabled':''}>إعادة النشر</button><button class="btn btn-danger btn-small" type="button" data-delete-listing="${escapeHtml(ad.id)}">حذف</button></div></div>`).join(''):emptyState('لا توجد إعلانات منشورة','أضف أول دورة أو درس خصوصي وسيظهر للطلاب مباشرة.','✎')}</div></div><div style="text-align:left;margin-top:12px"><button class="text-link" type="button" data-logout-manage>تسجيل الخروج من إدارة البطاقة</button></div></div></section>`;
+}function adminStats() { return `<div class="dashboard-cards"><div class="dash-stat"><span>طلبات المعلمين المعلّقة</span><strong>${db.teacherRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>بطاقات تذكارية للمراجعة</span><strong>${db.memorialRequests.filter(r=>r.status==='pending'||r.status==='needs_changes').length}</strong></div><div class="dash-stat"><span>البطاقات المنشورة</span><strong>${db.teachers.filter(t=>t.approved).length+db.memorials.filter(m=>m.approved).length}</strong></div></div>`; }
 function renderRequestCard(req,kind) {
   const isMem=kind==='memorial'; const data=req.data||{}; const statusLabel={pending:'بانتظار المراجعة',needs_changes:'بحاجة لاستكمال',approved:'معتمد',rejected:'مرفوض'}[req.status]||'قيد المراجعة';
   const education=(label,items)=>`<div class="request-education-row"><strong>${label}</strong><div class="request-education-values">${items.length?items.map(item=>`<span>${escapeHtml(item)}</span>`).join(''):'<span class="request-education-empty">لم يحدد</span>'}</div></div>`;
@@ -546,7 +609,7 @@ function render() {
   const focusedFeaturedSearch=document.activeElement?.id==='featured-admin-search';
   const featuredSelectionStart=focusedFeaturedSearch?document.activeElement.selectionStart:null;
   const featuredSelectionEnd=focusedFeaturedSearch?document.activeElement.selectionEnd:null;
-  const map={home:renderHome,teachers:renderTeachers,lessons:renderLessons,schools:renderSchools,memorials:renderMemorials,apply:renderApply,manage:renderManage,admin:renderAdmin,search:renderSearch};
+  const map={home:renderHome,teachers:renderTeachers,lessons:renderLessons,exams:renderExams,schools:renderSchools,memorials:renderMemorials,apply:renderApply,manage:renderManage,admin:renderAdmin,search:renderSearch};
   map.prelaunch=renderPrelaunch;
   app.innerHTML=(map[view]||renderHome)();
   if(view==='apply'){restoreApplyDraft(document.getElementById('apply-form'));renderTrackingTable();}
@@ -696,8 +759,32 @@ async function loginTeacher(form) {
       found=db.teachers.find(t=>String(t.id)===String(verifiedId));
     } else found=db.teachers.find(t=>t.name.trim().toLocaleLowerCase('ar')===values.name.trim().toLocaleLowerCase('ar')&&t.ownerCode===values.code);
     if(!found)throw new Error('لم نجد بطاقة معتمدة تطابق الاسم والرمز. تأكد منهما أو تواصل مع الإدارة.');
-    managingTeacherId=found.id;managingTeacherCode=values.code;manageError='';setView('manage');
+    managingTeacherId=String(found.id);managingTeacherCode=values.code;manageError='';
+    try{localStorage.setItem(TEACHER_SESSION_KEY,JSON.stringify({teacherId:managingTeacherId,controlCode:managingTeacherCode,name:found.name}));}catch{}
+    setView('manage');
   } catch(error) {manageError=error.message||'تعذّر التحقق من الرمز.';button.disabled=false;button.textContent='متابعة ←';render();}
+}
+async function saveTeacherProfile(form){
+  const teacher=teacherById(form.dataset.id);if(!teacher){toast('تعذر العثور على بطاقة المعلم. سجّل الدخول مجددًا.',true);return;}
+  const button=form.querySelector('button[type="submit"]'),values=formValues(form),years=Number(values.years);
+  button.disabled=true;button.textContent='جارٍ حفظ التعديلات…';
+  try{
+    if(!backendConnected)throw new Error('قاعدة البيانات غير متصلة. لم تُحفظ التعديلات؛ تحقق من الاتصال ثم أعد المحاولة.');
+    if(!Number.isInteger(years)||years<0||years>80)throw new Error('أدخل سنوات خبرة بين 0 و80.');
+    const contacts=[];
+    for(const number of [1,2]){
+      const digits=localPhoneDigits(values[`phone${number}`]),type=values[`phoneType${number}`]||'mobile';
+      if(!digits){if(number===1)throw new Error('رقم التواصل الأول مطلوب.');continue;}
+      if(type==='landline'?(digits.length<7||digits.length>9):digits.length!==9)throw new Error(type==='landline'?'أدخل 7 إلى 9 أرقام للهاتف الأرضي.':'أدخل 9 أرقام للجوال أو واتساب.');
+      contacts.push({type,value:formatSyriaPhone(digits,type)});
+    }
+    const services=[...new Set((values.services||'').split(/[،,]/).map(item=>item.trim()).filter(Boolean))];
+    if(services.length>20||services.some(item=>item.length>160))throw new Error('يمكن إدخال 20 خدمة كحد أقصى، وبحد 160 حرفًا لكل خدمة.');
+    const schoolId=values.schoolId?Number(values.schoolId):null;
+    await supabaseRpc('teacher_update_profile',{p_teacher_id:Number(teacher.id),p_control_code:managingTeacherCode,p_employment_status:values.status,p_experience_years:years,p_school_id:schoolId,p_biography:values.bio||null,p_address:values.address||null,p_services:services,p_contacts:contacts});
+    Object.assign(teacher,{status:values.status,years,schoolId:schoolId?String(schoolId):'',bio:values.bio||'',address:values.address||'',services,contacts});
+    render();toast('حُفظت بيانات بطاقتك في المنصة.');
+  }catch(error){button.disabled=false;button.textContent='حفظ التعديلات';toast(error.message||'تعذر حفظ التعديلات.',true);}
 }
 function logoutAdmin(){clearAdminSession();adminQueueLoaded=false;adminLoginError='';render();}
 function openTeacher(id) {
@@ -808,7 +895,7 @@ async function deleteSchool(id,button){
 }
 function slideDialog(id=''){
   const slide=id?db.slides.find(item=>item.id===String(id)):null;if(id&&!slide)return;selectedSlidePhoto='';
-  const destinations=[['teachers','المعلمون والمعلمات'],['lessons','الدورات والدروس'],['schools','المدارس'],['memorials','تركوا أثرًا'],['apply','نموذج التقديم']];
+  const destinations=[['teachers','المعلمون والمعلمات'],['lessons','الدورات والدروس'],['exams','الامتحانات'],['schools','المدارس'],['memorials','تركوا أثرًا'],['apply','نموذج التقديم']];
   const options=current=>destinations.map(([value,label])=>`<option value="${value}" ${current===value?'selected':''}>${label}</option>`).join('');
   modalRoot.innerHTML=`<div class="modal-backdrop" data-close-modal><section class="modal slide-editor-modal" role="dialog" aria-modal="true" aria-label="${slide?'تعديل الشريحة':'إضافة شريحة'}"><button class="modal-close" data-close-modal aria-label="إغلاق">×</button><h2>${slide?'تعديل الشريحة':'إضافة شريحة للسلايدر'}</h2><p class="consent">تحافظ الواجهة على الألوان والتوزيع الحاليين. الصورة اختيارية وتظهر كخلفية خفيفة خلف الرسم.</p><form id="homepage-slide-form" data-slide-id="${slide?escapeHtml(slide.id):''}" data-image-url="${escapeHtml(slide?.image||'')}"><div class="form-grid"><div class="field"><label>النص الصغير أعلى العنوان</label><input name="eyebrow" required maxlength="100" value="${escapeHtml(slide?.eyebrow||'')}"></div><div class="field"><label>ترتيب الشريحة</label><input name="sortOrder" type="number" min="1" value="${slide?slide.sortOrder+1:db.slides.length+1}" required></div><div class="field full"><label>السطر الأول من العنوان</label><input name="titleLine" required maxlength="200" value="${escapeHtml(slide?.titleLine||'')}"></div><div class="field full"><label>السطر الملوّن من العنوان</label><input name="titleEmphasis" required maxlength="200" value="${escapeHtml(slide?.titleEmphasis||'')}"></div><div class="field full"><label>النص التوضيحي</label><textarea name="description" required maxlength="600">${escapeHtml(slide?.desc||'')}</textarea></div><div class="field"><label>نص الزر الأول</label><input name="primary" required maxlength="80" value="${escapeHtml(slide?.primary||'')}"></div><div class="field"><label>وجهة الزر الأول</label><select name="primaryView">${options(slide?.primaryView||'teachers')}</select></div><div class="field"><label>نص الزر الثاني</label><input name="secondary" required maxlength="80" value="${escapeHtml(slide?.secondary||'')}"></div><div class="field"><label>وجهة الزر الثاني</label><select name="secondaryView">${options(slide?.secondaryView||'lessons')}</select></div><div class="field full"><label>صورة خلفية للشريحة <span class="hint">اختيارية</span></label><label class="upload-box">${slide?.image?`<img class="upload-preview" src="${escapeHtml(slide.image)}" alt="معاينة صورة السلايدر">`:''}<span class="upload-symbol">▧</span><span><strong>اختر صورة</strong><small>ستبقى الخلفية الزرقاء والرسم والتنسيق الحالي كما هي</small></span><input type="file" accept="image/*" data-slide-photo></label></div><div class="field full"><label class="check-chip"><input type="checkbox" name="isActive" ${slide?.active===false?'':'checked'}><span>إظهار هذه الشريحة</span></label></div></div><div class="form-footer"><span class="consent">سيظهر التعديل في الرئيسية فور الحفظ.</span><button type="submit" class="btn btn-primary">حفظ الشريحة</button></div></form></section></div>`;
 }
@@ -834,6 +921,7 @@ function listingDialog(teacher, listing=null) {
 }
 
 document.addEventListener('click',event=>{
+  const bioToggle=event.target.closest('.bio-toggle');if(bioToggle){event.stopPropagation();const card=bioToggle.closest('.teacher-card,.memorial-card');const expanded=bioToggle.getAttribute('aria-expanded')==='true';bioToggle.setAttribute('aria-expanded',String(!expanded));card?.classList.toggle('bio-expanded',!expanded);bioToggle.innerHTML=expanded?'اقرأ المزيد <span aria-hidden="true">⌄</span>':'إخفاء النبذة <span aria-hidden="true">⌃</span>';return;}
   const searchType=event.target.closest('[data-search-type]');if(searchType){const next=searchType.dataset.searchType;searchResultFilter=searchResultFilter===next?'all':next;searchLimit=20;render();return;}
   if(event.target.closest('[data-retry-content]')){void hydrateFromSupabase();return;}
   const cropAccept=event.target.closest('[data-crop-accept]');if(cropAccept&&photoCrop){const crop=photoCrop,data=crop.getDataUrl();photoCrop=null;modalRoot.innerHTML='';crop.onComplete(data);return;}
@@ -841,15 +929,15 @@ document.addEventListener('click',event=>{
   const cropCancel=event.target.closest('[data-crop-cancel]');if(cropCancel&&photoCrop){photoCrop.inputElement.value='';photoCrop=null;modalRoot.innerHTML='';return;}
   const viewBtn=event.target.closest('[data-view]');if(viewBtn){if(viewBtn.dataset.formKind)teacherFormMode=viewBtn.dataset.formKind;setView(viewBtn.dataset.view);return;}
   const mode=event.target.closest('[data-form-mode]');if(mode){teacherFormMode=mode.dataset.formMode;selectedPhoto='';render();return;}
-  const slide=event.target.closest('[data-slide]');if(slide){heroIndex=Number(slide.dataset.slide);render();return;}
-  if(event.target.closest('[data-slide-next]')){if(!slides.length)return;heroIndex=(heroIndex+1)%slides.length;render();return;}
+  const slide=event.target.closest('[data-slide]');if(slide){heroIndex=Number(slide.dataset.slide);refreshHeroInPlace();return;}
+  if(event.target.closest('[data-slide-next]')){if(!slides.length)return;heroIndex=(heroIndex+1)%slides.length;refreshHeroInPlace();return;}
   if(event.target.closest('[data-load-more]')){searchLimit+=20;render();return;}
   const teacher=event.target.closest('[data-open-teacher]');if(teacher){openTeacher(teacher.dataset.openTeacher);return;}
   const share=event.target.closest('[data-share-teacher]');if(share){event.stopPropagation();shareTeacher(share.dataset.shareTeacher);return;}
   const shareListingButton=event.target.closest('[data-share-listing]');if(shareListingButton){event.stopPropagation();void shareListing(shareListingButton.dataset.shareListing);return;}
   const down=event.target.closest('[data-download-card]');if(down){downloadCard(down.dataset.downloadCard);return;}
   const closeTarget=event.target.closest('[data-close-modal]');if(closeTarget&&(event.target===closeTarget||event.target.matches('button[data-close-modal]'))){if(photoCrop?.inputElement)photoCrop.inputElement.value='';photoCrop=null;modalRoot.innerHTML='';return;}
-  const staff=event.target.closest('[data-school-staff]');if(staff){const s=schoolById(staff.dataset.schoolStaff);const teachers=db.teachers.filter(t=>t.schoolId===s?.id&&t.approved);modalRoot.innerHTML=`<div class="modal-backdrop" data-close-modal><section class="modal"><button class="modal-close" data-close-modal>×</button><h2>كادر ${escapeHtml(s?.name||'المدرسة')}</h2><p>${teachers.length?`<div class="teacher-grid">${teachers.map(teacherCard).join('')}</div>`:'لا توجد بطاقات معلمين مرتبطة بهذه المدرسة بعد.'}</p></section></div>`;return;}
+  const staff=event.target.closest('[data-school-staff]');if(staff){const s=schoolById(staff.dataset.schoolStaff);const teachers=db.teachers.filter(t=>t.schoolId===s?.id&&t.approved);modalRoot.innerHTML=`<div class="modal-backdrop" data-close-modal><section class="modal school-staff-modal" role="dialog" aria-modal="true" aria-label="كادر ${escapeHtml(s?.name||'المدرسة')}"><button class="modal-close" data-close-modal aria-label="إغلاق">×</button><h2>كادر ${escapeHtml(s?.name||'المدرسة')}</h2>${teachers.length?`<div class="school-staff-grid">${teachers.map(schoolStaffCard).join('')}</div>`:`<div class="school-staff-empty">لا توجد بطاقات معلمين مرتبطة بهذه المدرسة بعد.</div>`}</section></div>`;return;}
   const adminSectionBtn=event.target.closest('[data-admin-section]');if(adminSectionBtn){adminSection=adminSectionBtn.dataset.adminSection;render();return;}
   const adminContentTab=event.target.closest('[data-admin-content-kind]');if(adminContentTab){adminContentKind=adminContentTab.dataset.adminContentKind;render();return;}
   const adminVisibility=event.target.closest('[data-admin-visibility]');if(adminVisibility){void setAdminContentVisibility(adminVisibility.dataset.adminVisibility,adminVisibility.dataset.id,adminVisibility.dataset.visible==='true',adminVisibility);return;}
@@ -868,7 +956,7 @@ document.addEventListener('click',event=>{
   const review=event.target.closest('[data-review]');if(review){reviewRequest(review.dataset.id,review.dataset.kind,review.dataset.review);return;}
   if(event.target.closest('[data-admin-logout]')){logoutAdmin();return;}
   const copy=event.target.closest('[data-copy-code]');if(copy){navigator.clipboard.writeText(copy.dataset.copyCode).then(()=>toast('نُسخ رمز التحكم.')).catch(()=>toast('انسخ الرمز يدويًا.',true));return;}
-  if(event.target.closest('[data-logout-manage]')){managingTeacherId='';managingTeacherCode='';manageError='';setView('manage');return;}
+  if(event.target.closest('[data-logout-manage]')){managingTeacherId='';managingTeacherCode='';manageError='';try{localStorage.removeItem(TEACHER_SESSION_KEY);}catch{}setView('manage');return;}
   if(event.target.closest('[data-add-listing]')){listingDialog(teacherById(managingTeacherId));return;}
   const edit=event.target.closest('[data-edit-listing]');if(edit){const l=db.listings.find(x=>x.id===edit.dataset.editListing);listingDialog(teacherById(managingTeacherId),l);return;}
   const del=event.target.closest('[data-delete-listing]');if(del){void deleteTeacherListing(del.dataset.deleteListing,del);return;}
@@ -881,6 +969,7 @@ document.addEventListener('click',event=>{
 
 document.addEventListener('input',event=>{
   if(event.target.matches('[data-syria-phone]')){const input=event.target;const digits=localPhoneDigits(input.value);input.value=digits.slice(0,9);return;}
+  if(event.target.matches('[data-manage-phone]')){const input=event.target;const digits=localPhoneDigits(input.value);input.value=digits.slice(0,9);return;}
   if(event.target.id==='featured-admin-search'){featuredAdminSearch=event.target.value;render();return;}
   if(event.target.closest('#home-search')){const form=event.target.closest('#home-search');homeSearchDraft={query:form.elements.query.value,mode:form.elements.mode.value,subject:form.elements.subject.value};clearTimeout(searchDebounceTimer);const scheduledView=view;searchDebounceTimer=setTimeout(()=>{if(view!==scheduledView||view!=='home')return;searchState={query:homeSearchDraft.query,mode:homeSearchDraft.mode,subject:homeSearchDraft.subject,grade:''};if(!homeSearchDraft.query.trim())searchResultFilter='all';searchLimit=20;render();},400);return;}
   const cropZoom=event.target.closest('[data-crop-zoom]');if(cropZoom&&photoCrop){photoCrop.setZoom(Number(cropZoom.value));return;}
@@ -902,6 +991,7 @@ document.addEventListener('input',event=>{const form=event.target.closest('#appl
 document.addEventListener('change',event=>{const form=event.target.closest('#apply-form');if(form)saveApplyDraft(form);});
 
 document.addEventListener('change',event=>{
+  if(event.target.matches('[data-manage-phone-type]')){const number=event.target.dataset.managePhoneType,type=event.target.value,input=document.querySelector(`[data-manage-phone="${number}"]`);if(input){input.maxLength=9;input.minLength=type==='landline'?7:9;input.pattern=type==='landline'?'[0-9]{7,9}':'[0-9]{9}';input.placeholder=type==='landline'?'أدخل 7 إلى 9 أرقام':'أدخل 9 أرقام';input.value=localPhoneDigits(input.value).slice(0,9);}const prefix=document.querySelector(`[data-manage-phone-prefix="${number}"]`);if(prefix)prefix.textContent=phonePrefix(type);const hint=document.querySelector(`[data-manage-phone-hint="${number}"]`);if(hint)hint.textContent=type==='landline'?'أدخل من 7 إلى 9 أرقام بعد +963 11.':'أدخل 9 أرقام بعد +963.';return;}
   if(event.target.matches('[data-phone-type]')){const form=event.target.closest('#apply-form');if(form)syncSyriaPhoneField(form,event.target.dataset.phoneType);return;}
   if(event.target.id==='featured-admin-sort'){featuredAdminSort=event.target.value;render();return;}
   if(event.target.closest('#home-search')){if(event.target.tagName==='SELECT'){const form=event.target.closest('#home-search');homeSearchDraft={query:form.elements.query.value,mode:form.elements.mode.value,subject:form.elements.subject.value};searchState={query:homeSearchDraft.query,mode:homeSearchDraft.mode,subject:homeSearchDraft.subject,grade:''};if(!homeSearchDraft.query.trim())searchResultFilter='all';searchLimit=20;clearTimeout(searchDebounceTimer);render();}return;}
@@ -945,7 +1035,7 @@ document.addEventListener('submit',event=>{
     void loginTeacher(form);return;
   }
   if(form.id==='profile-edit'){
-    const t=teacherById(form.dataset.id);if(!t)return;const v=formValues(form);t.status=v.status;t.years=Number(v.years)||0;t.schoolId=v.schoolId||'';t.bio=v.bio;t.address=v.address;t.services=(v.services||'').split(/[،,]/).map(x=>x.trim()).filter(Boolean);t.contacts=[];if(v.phone1)t.contacts.push({type:v.phoneType1,value:v.phone1});if(v.phone2)t.contacts.push({type:v.phoneType2,value:v.phone2});persist();render();toast('تم حفظ التعديلات.');return;
+    void saveTeacherProfile(form);return;
   }
   if(form.id==='listing-form'){void saveListingForm(form);return;}
   if(form.id==='school-add-form'){void saveSchoolForm(form);return;}
@@ -964,11 +1054,12 @@ const prelaunchHome=pageView==='public'&&window.DAMEER_SUPABASE?.prelaunchMode==
 if(prelaunchHome){view='prelaunch';document.body.classList.add('prelaunch-mode');document.title='التسجيل المبكر — منصة الضمير التعليمية';document.querySelector('.header-apply')?.replaceChildren(document.createTextNode('التسجيل المبكر'),Object.assign(document.createElement('span'),{textContent:' ＋'}));}
 else if(['apply','manage','admin'].includes(pageView))view=pageView;
 else if(dedicatedPageFiles[initial])location.replace(`${dedicatedPageFiles[initial]}#${initial}`);
-else if(['home','teachers','lessons','schools','memorials','search'].includes(initial))view=initial;
+else if(['home','teachers','lessons','exams','schools','memorials','search'].includes(initial))view=initial;
 if(prelaunchHome)render();else renderWithAnchor();
 if(!prelaunchHome)void hydrateFromSupabase();
 if(view==='apply')void refreshTrackedApplications();
 setInterval(()=>{if(view==='apply')void refreshTrackedApplications();},60000);
-setInterval(()=>{if(view==='home'&&slides.length){heroIndex=(heroIndex+1)%slides.length;const y=window.scrollY;render();window.scrollTo(0,y);}},6500);
+setInterval(()=>{if(view==='home'&&slides.length){heroIndex=(heroIndex+1)%slides.length;refreshHeroInPlace();}},6500);
+setInterval(()=>{const items=db.memorials.filter(item=>item.approved);if(view==='home'&&items.length>3){const pinned=items.some(item=>item.featured)?1:0;homeMemorialRotation=(homeMemorialRotation+1)%Math.max(items.length-pinned,1);const grid=document.getElementById('home-memorial-grid');if(grid)grid.innerHTML=homeMemorialSelection().map(memorialCard).join('');}},15000);
 
 
